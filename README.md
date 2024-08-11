@@ -4,7 +4,7 @@ Share files fast in a local trusted network, without encryption.
 
 ## Specification
 
-See [PROTOCOL.md].
+See [PROTOCOL.md](PROTOCOL.md).
 
 ## FAQ
 
