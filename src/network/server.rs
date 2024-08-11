@@ -1,7 +1,5 @@
-use crate::{network::addresses, protocol::Message};
-
-use super::{create_socket, IPVersion, SocketMode};
-use std::net::SocketAddr;
+use super::{addresses, create_socket, IPVersion, SocketMode};
+use crate::protocol::Message;
 
 pub async fn serve(name: &str, ip_version: IPVersion) -> eyre::Result<()> {
     let addr = addresses(ip_version);

@@ -1,9 +1,11 @@
 mod network;
 mod protocol;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use network::{client::send, server::serve, IPVersion};
 use std::path::PathBuf;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -29,9 +31,20 @@ enum Command {
     },
 }
 
+fn init() {
+    if cfg!(feature = "tokio-console") {
+        tracing_subscriber::registry()
+            .with(console_subscriber::spawn())
+            .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_default_env()))
+            .init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    tracing_subscriber::fmt::init();
+    init();
 
     let args = Args::parse();
 
@@ -50,8 +63,12 @@ async fn main() -> eyre::Result<()> {
                 let hostname = hostname::get()?;
                 hostname.to_string_lossy().into_owned()
             };
-            serve(&name, ip_version).await
+            serve(&name, ip_version).await?;
         }
-        Command::Send { path } => send(ip_version, &path).await,
+        Command::Send { path } => {
+            send(ip_version, &path).await;
+        }
     }
+
+    Ok(())
 }

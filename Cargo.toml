@@ -3,13 +3,30 @@ name = "ffs"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# also requires `RUSTFLAGS="--cfg tokio_unstable"`
+tokio-console = ["tokio/tracing"]
+
 [dependencies]
 bitcode = "0.6.3"
 clap = { version = "4.5.15", features = ["derive"] }
+console-subscriber = "0.4.0"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
 eyre = "0.6.12"
 hostname = "0.4.0"
+ratatui = "0.28.0"
 sha2 = "0.10.8"
 socket2 = "0.5.7"
-tokio = { version = "1.39.2", features = ["rt-multi-thread", "net", "time", "macros", "sync", "fs", "io-util"] }
+tokio = { version = "1.39.2", features = [
+  "rt-multi-thread",
+  "net",
+  "time",
+  "macros",
+  "sync",
+  "fs",
+  "io-util",
+] }
+tokio-stream = { version = "0.1.15", features = ["sync"] }
+tokio-util = "0.7.11"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"

@@ -30,6 +30,7 @@ fn create_socket(addr: SocketAddr, mode: SocketMode) -> io::Result<UdpSocket> {
     };
 
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_nonblocking(true)?;
 
     if matches!(mode, SocketMode::Receive) {
         match addr.ip() {
