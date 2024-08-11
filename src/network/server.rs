@@ -12,7 +12,10 @@ pub async fn serve(name: &str, ip_version: IPVersion) -> eyre::Result<()> {
 
     loop {
         let (_, addr) = listen_socket.recv_buf_from(&mut buf).await?;
-        let msg: Message = bitcode::decode(&buf)?;
+        let Ok(msg) = bitcode::decode(&buf) else {
+            tracing::error!(?buf, "invalid message received");
+            continue;
+        };
         match msg {
             Message::Discover => {
                 let announce_msg = Message::Announce(name);
