@@ -34,6 +34,7 @@ enum Command {
     Send {
         #[arg(short, long)]
         interactive: bool,
+        // TODO: this could be optional in interactive mode
         path: PathBuf,
     },
 }

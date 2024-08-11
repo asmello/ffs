@@ -20,6 +20,12 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+// assuming MTU of 1500 (typical for ethernet), this is
+// 1500 - 40 (ipv6 header) - 8 (udp header) = 1452.
+// if we estimate this too high, most networks will just
+// fragment the packet, which is not the end of the world.
+const DATAGRAM_SIZE_LIMIT: usize = 1452;
+
 pub async fn send_to_all(ip_version: IPVersion, path: &Path) -> eyre::Result<()> {
     let addr = addresses(ip_version);
     let socket = Arc::new(create_socket(addr.send, SocketMode::Send)?);
@@ -62,8 +68,7 @@ pub async fn send_to_all(ip_version: IPVersion, path: &Path) -> eyre::Result<()>
 }
 
 async fn start_sending(path: PathBuf, socket: Arc<UdpSocket>, dst: SocketAddr) -> eyre::Result<()> {
-    use rand::prelude::*;
-
+    use rand::Rng;
     let nonce: u32 = rand::thread_rng().gen();
 
     let mut file = tokio::fs::File::open(&path).await?;
@@ -261,9 +266,7 @@ async fn send_all_chunks(
     let mut file = tokio::fs::File::open(path.as_ref()).await?;
 
     // holds chunks, which can only grow as large as a datagram payload.
-    // assuming MTU of 1500 (typical for ethernet), this is
-    // 1500 - 40 (ipv6 header) - 8 (udp header) = 1452.
-    let mut buf = Vec::with_capacity(1452);
+    let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
     let mut chunk = 0;
 
     loop {
@@ -287,8 +290,7 @@ async fn resend_chunks(
     // we reopen the file so we can seek independently
     let mut file = tokio::fs::File::open(path.as_ref()).await?;
 
-    // see comment in [`send_chunks`]
-    let mut buf = Vec::with_capacity(1452);
+    let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
 
     for chunk in chunks {
         file.seek(io::SeekFrom::Start(chunk)).await?;
