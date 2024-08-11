@@ -1,9 +1,14 @@
+mod file_generator;
 mod network;
 mod protocol;
 mod tui;
 
 use clap::{Parser, Subcommand};
-use network::{client::send, server::serve, IPVersion};
+use network::{
+    client::{send_interactive, send_to_all},
+    server::serve,
+    IPVersion,
+};
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -27,6 +32,8 @@ enum Command {
         name: Option<String>,
     },
     Send {
+        #[arg(short, long)]
+        interactive: bool,
         path: PathBuf,
     },
 }
@@ -65,8 +72,12 @@ async fn main() -> eyre::Result<()> {
             };
             serve(&name, ip_version).await?;
         }
-        Command::Send { path } => {
-            send(ip_version, &path).await;
+        Command::Send { path, interactive } => {
+            if interactive {
+                send_interactive(ip_version, &path).await;
+            } else {
+                send_to_all(ip_version, &path).await?;
+            }
         }
     }
 

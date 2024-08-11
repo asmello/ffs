@@ -1,6 +1,6 @@
 use bitcode::{Decode, Encode};
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum Message<'data> {
     Discover,
     Announce(&'data str),
