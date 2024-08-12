@@ -14,9 +14,9 @@ const LISTEN_PORT: u16 = 43549;
 
 type Hash = [u8; 16];
 
-pub enum IPVersion {
-    IPV4,
-    IPV6,
+pub enum IpVersion {
+    V4,
+    V6,
 }
 
 enum SocketMode {
@@ -57,13 +57,13 @@ struct Addresses {
     recv: SocketAddr,
 }
 
-fn addresses(ip_version: IPVersion) -> Addresses {
+fn addresses(ip_version: IpVersion) -> Addresses {
     match ip_version {
-        IPVersion::IPV4 => Addresses {
+        IpVersion::V4 => Addresses {
             send: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             recv: SocketAddr::new(IPV4_MULTICAST_ADDR.into(), LISTEN_PORT),
         },
-        IPVersion::IPV6 => Addresses {
+        IpVersion::V6 => Addresses {
             send: SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
             recv: SocketAddr::new(IPV6_MULTICAST_ADDR.into(), LISTEN_PORT),
         },

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use network::{
     client::{send_interactive, send_to_all},
     server::serve,
-    IPVersion,
+    IpVersion,
 };
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -60,9 +60,9 @@ async fn main() -> eyre::Result<()> {
 
     let ip_version = match (args.use_ipv4, args.use_ipv6) {
         (true, true) => unreachable!("clap should enforce ip version choice is mutually exclusive"),
-        (true, false) => IPVersion::IPV4,
-        (false, true) => IPVersion::IPV6,
-        (false, false) => IPVersion::IPV6, // default if neither is set explicitly
+        (true, false) => IpVersion::V4,
+        (false, true) => IpVersion::V6,
+        (false, false) => IpVersion::V6, // default if neither is set explicitly
     };
 
     match args.cmd {

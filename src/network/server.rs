@@ -1,4 +1,4 @@
-use super::{addresses, create_socket, Hash, IPVersion, SocketMode};
+use super::{addresses, create_socket, Hash, IpVersion, SocketMode};
 use crate::protocol::{ClientMessage, ServerMessage};
 use rand::Rng;
 use std::{collections::HashMap, io};
@@ -14,7 +14,7 @@ struct FileEntry {
     expected_size: usize,
 }
 
-pub async fn serve(name: &str, ip_version: IPVersion, overwrite: bool) -> eyre::Result<()> {
+pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::Result<()> {
     let addr = addresses(ip_version);
     let listen_socket = create_socket(addr.recv, SocketMode::Receive)?;
     let send_socket = create_socket(addr.send, SocketMode::Send)?;

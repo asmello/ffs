@@ -1,4 +1,4 @@
-use super::{addresses, create_socket, IPVersion, SocketMode};
+use super::{addresses, create_socket, IpVersion, SocketMode};
 use crate::{
     file_generator::FileGenerator,
     protocol::{ClientMessage, Hash, ServerMessage},
@@ -32,7 +32,7 @@ const DATAGRAM_SIZE_LIMIT: usize = 1452;
 // set to tokio's default `max_buf_size`
 const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
-pub async fn send_to_all(ip_version: IPVersion, path: &Path) -> eyre::Result<()> {
+pub async fn send_to_all(ip_version: IpVersion, path: &Path) -> eyre::Result<()> {
     let addr = addresses(ip_version);
     let socket = Arc::new(create_socket(addr.send, SocketMode::Send)?);
     let mut files = FileGenerator::new(path);
@@ -321,7 +321,7 @@ async fn send_chunk(
     Ok(n)
 }
 
-pub async fn send_interactive(ip_version: IPVersion, _path: &Path) {
+pub async fn send_interactive(ip_version: IpVersion, _path: &Path) {
     let cancel = CancellationToken::new();
 
     let mut tasks = JoinSet::new();
@@ -349,7 +349,7 @@ pub async fn send_interactive(ip_version: IPVersion, _path: &Path) {
     }
 }
 
-async fn network_loop(ip_version: IPVersion, cancel: CancellationToken) -> eyre::Result<()> {
+async fn network_loop(ip_version: IpVersion, cancel: CancellationToken) -> eyre::Result<()> {
     let addr = addresses(ip_version);
     let socket = create_socket(addr.send, SocketMode::Send)?;
 
