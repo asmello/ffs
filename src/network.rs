@@ -12,6 +12,8 @@ const IPV6_MULTICAST_ADDR: Ipv6Addr = Ipv6Addr::new(0xff08, 0, 0, 0, 0, 0, 0xda,
 const IPV4_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 242);
 const LISTEN_PORT: u16 = 43549;
 
+type Hash = [u8; 16];
+
 pub enum IPVersion {
     IPV4,
     IPV6,

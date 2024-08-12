@@ -1,5 +1,9 @@
 use super::{addresses, create_socket, IPVersion, SocketMode};
-use crate::{file_generator::FileGenerator, protocol::Message, tui::Tui};
+use crate::{
+    file_generator::FileGenerator,
+    protocol::{ClientMessage, Hash, ServerMessage},
+    tui::Tui,
+};
 use crossterm::event::{Event, KeyCode};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use sha2::{Digest, Sha256};
@@ -25,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 // if we estimate this too high, most networks will just
 // fragment the packet, which is not the end of the world.
 const DATAGRAM_SIZE_LIMIT: usize = 1452;
+// set to tokio's default `max_buf_size`
+const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
 pub async fn send_to_all(ip_version: IPVersion, path: &Path) -> eyre::Result<()> {
     let addr = addresses(ip_version);
@@ -77,11 +83,10 @@ async fn start_sending(path: PathBuf, socket: Arc<UdpSocket>, dst: SocketAddr) -
         meta.len()
     };
 
-    // allocate up to 4MB
-    let buf_size = size.min(4 * 1024 * 1024);
+    let buf_size = size.min(CHUNK_SIZE);
     let mut buf = Vec::with_capacity(buf_size as usize);
 
-    let hash: [u8; 16] = {
+    let hash: Hash = {
         // scan the file once to compute its hash
         // TODO: is there a better way?
         let mut hasher = Sha256::new();
@@ -111,7 +116,7 @@ async fn start_sending(path: PathBuf, socket: Arc<UdpSocket>, dst: SocketAddr) -
                 .to_str()
                 .ok_or_else(|| eyre::eyre!("not a valid utf-8 path: {path:?}"))?;
 
-            let msg = Message::Start {
+            let msg = ClientMessage::Start {
                 nonce,
                 size,
                 hash,
@@ -173,13 +178,13 @@ async fn handle_server_messages(
     loop {
         buf.clear();
         let (_, dst) = socket.recv_buf_from(&mut buf).await?;
-        let Ok(msg) = bitcode::decode::<Message>(&buf) else {
+        let Ok(msg) = bitcode::decode::<ServerMessage>(&buf) else {
             tracing::error!(?buf, "received invalid message");
             continue;
         };
 
         match msg {
-            Message::Ack {
+            ServerMessage::Ack {
                 nonce: server_nonce,
                 id,
             } => {
@@ -199,7 +204,7 @@ async fn handle_server_messages(
                 ));
                 try_send!(handle);
             }
-            Message::Nack {
+            ServerMessage::Nack {
                 nonce: server_nonce,
                 msg,
             } => {
@@ -212,14 +217,14 @@ async fn handle_server_messages(
                 }
                 tracing::error!(msg, "server rejected file transfer");
             }
-            Message::Error { id, msg } => {
+            ServerMessage::Error { id, msg } => {
                 if sessions.remove(&id).is_some() {
                     tracing::error!(msg, "remote server error, session terminated");
                 } else {
                     tracing::debug!(msg, "ignoring server error for unknown session {id:#08x}");
                 }
             }
-            Message::Repeat { id, chunks } => {
+            ServerMessage::Repeat { id, chunks } => {
                 if let Some(dst) = sessions.get(&id) {
                     let handle = tokio::spawn(resend_chunks(
                         Arc::clone(&path),
@@ -233,7 +238,7 @@ async fn handle_server_messages(
                     tracing::debug!("ignoring repeat message for unknown session {id:#08x}");
                 }
             }
-            Message::Done { id } => {
+            ServerMessage::Done { id } => {
                 if sessions.remove(&id).is_some() {
                     tracing::info!("completed session {id:#08x} successfully");
                     if sessions.is_empty() {
@@ -244,11 +249,8 @@ async fn handle_server_messages(
                     tracing::debug!("ignoring unknown session completion {id:#08x}");
                 }
             }
-            Message::Discover
-            | Message::Announce(_)
-            | Message::Start { .. }
-            | Message::Data { .. } => {
-                tracing::error!(?msg, "unexpected message from server");
+            ServerMessage::Announce(src) => {
+                tracing::trace!(src, "ignoring announce message");
             }
         }
     }
@@ -310,7 +312,7 @@ async fn send_chunk(
 ) -> eyre::Result<usize> {
     buf.clear();
     let n = file.read_buf(buf).await?;
-    let payload = bitcode::encode(&Message::Data {
+    let payload = bitcode::encode(&ClientMessage::Data {
         id,
         chunk,
         content: std::mem::take(buf),
@@ -351,7 +353,7 @@ async fn network_loop(ip_version: IPVersion, cancel: CancellationToken) -> eyre:
     let addr = addresses(ip_version);
     let socket = create_socket(addr.send, SocketMode::Send)?;
 
-    let discover_msg = bitcode::encode(&Message::Discover);
+    let discover_msg = bitcode::encode(&ClientMessage::Discover);
     socket.send_to(&discover_msg, addr.recv).await?;
 
     let mut buf = Vec::with_capacity(65536);
@@ -359,7 +361,7 @@ async fn network_loop(ip_version: IPVersion, cancel: CancellationToken) -> eyre:
         tokio::select! {
             r = socket.recv_buf_from(&mut buf) => {
                 let (_, addr) = r?;
-                let msg: Message = bitcode::decode(&buf)?;
+                let msg: ServerMessage = bitcode::decode(&buf)?;
                 handle_message(addr, msg);
                 buf.clear();
             }
@@ -373,26 +375,16 @@ async fn network_loop(ip_version: IPVersion, cancel: CancellationToken) -> eyre:
     Ok(())
 }
 
-fn handle_message(src: SocketAddr, msg: Message) {
+fn handle_message(src: SocketAddr, msg: ServerMessage) {
     match msg {
-        Message::Discover => {
-            tracing::error!("client received discover message");
-        }
-        Message::Announce(name) => {
+        ServerMessage::Announce(name) => {
             tracing::info!(addr = %src, "discovered server: {name}");
         }
-        Message::Start {
-            nonce,
-            size,
-            hash,
-            path,
-        } => todo!(),
-        Message::Ack { nonce, id } => todo!(),
-        Message::Nack { nonce, msg } => todo!(),
-        Message::Data { id, chunk, content } => todo!(),
-        Message::Error { id, msg } => todo!(),
-        Message::Repeat { id, chunks } => todo!(),
-        Message::Done { id } => todo!(),
+        ServerMessage::Ack { nonce, id } => todo!(),
+        ServerMessage::Nack { nonce, msg } => todo!(),
+        ServerMessage::Error { id, msg } => todo!(),
+        ServerMessage::Repeat { id, chunks } => todo!(),
+        ServerMessage::Done { id } => todo!(),
     }
 }
 

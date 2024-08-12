@@ -30,6 +30,8 @@ enum Command {
     Serve {
         /// Name of this server for advertisement.
         name: Option<String>,
+        /// Whether to allow overwriting existing files.
+        overwrite: bool,
     },
     Send {
         #[arg(short, long)]
@@ -64,14 +66,14 @@ async fn main() -> eyre::Result<()> {
     };
 
     match args.cmd {
-        Command::Serve { name } => {
+        Command::Serve { name, overwrite } => {
             let name = if let Some(name) = name {
                 name
             } else {
                 let hostname = hostname::get()?;
                 hostname.to_string_lossy().into_owned()
             };
-            serve(&name, ip_version).await?;
+            serve(&name, ip_version, overwrite).await?;
         }
         Command::Send { path, interactive } => {
             if interactive {

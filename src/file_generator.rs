@@ -2,8 +2,7 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
-use tokio::fs::{File, ReadDir};
-use tokio_stream::Stream;
+use tokio::fs::ReadDir;
 
 // TODO: symbolic links?
 pub struct FileGenerator {
