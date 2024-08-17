@@ -27,20 +27,17 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
-// assuming MTU of 1500 (typical for ethernet), this is
-// 1500 - 40 (ipv6 header) - 8 (udp header) = 1452.
-// if we estimate this too high, most networks will just
-// fragment the packet, which is not the end of the world.
+// assuming MTU of 1500 (typical for ethernet), this is 1500 - 40 (ipv6 header)
+// - 8 (udp header) = 1452. if we estimate this too high, most networks will
+// just fragment the packet, which is not the end of the world, but may increase
+// re-send rate (as even one fragment lost invalidates the entire datagram).
 const DATAGRAM_SIZE_LIMIT: usize = 1452;
-// set to tokio's default `max_buf_size`
-const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
 pub async fn send_to_all(ip_version: IpVersion, path: &Path) -> eyre::Result<()> {
-    let addr = addresses(ip_version);
-    let socket = Arc::new(create_socket(addr.send, SocketMode::Send)?);
     let mut tasks = Vec::new();
-
     let mut task_rx = {
+        let addr = addresses(ip_version);
+        let socket = create_socket(addr.send, SocketMode::Send)?;
         let (task_tx, task_rx) = mpsc::unbounded_channel();
         // TODO: non-empty stream!
         let handle = tokio::spawn(dispatch_server_msgs(
@@ -84,16 +81,17 @@ pub async fn send_to_all(ip_version: IpVersion, path: &Path) -> eyre::Result<()>
 
 // NOTE: this task must be the exclusive reader of the socket
 async fn dispatch_server_msgs(
-    socket: Arc<UdpSocket>,
+    socket: UdpSocket,
     bcast_addr: SocketAddr,
     paths: impl Stream<Item = io::Result<PathBuf>>,
     task_sender: mpsc::UnboundedSender<(JoinHandle<eyre::Result<()>>, String)>,
 ) -> eyre::Result<()> {
-    tokio::pin!(paths);
+    let socket = Arc::new(socket);
     let mut error_count = 0;
     let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
     let mut pending_sessions = HashMap::new();
     let mut sessions = HashMap::new();
+    tokio::pin!(paths);
     loop {
         buf.clear();
         tokio::select! {
@@ -107,7 +105,7 @@ async fn dispatch_server_msgs(
                         continue;
                     }
                 };
-                let (nonce, size) = start_session(&path, Arc::clone(&socket), bcast_addr).await?;
+                let (nonce, size) = start_session(&path, &socket, bcast_addr).await?;
                 pending_sessions.insert(nonce, (path, size));
             }
             r = socket.recv_buf_from(&mut buf) => {
@@ -116,7 +114,7 @@ async fn dispatch_server_msgs(
                     tracing::error!(?buf, "received invalid message");
                     continue;
                 };
-                handle_msg(src, msg, &mut pending_sessions, &mut sessions, Arc::clone(&socket), bcast_addr, task_sender.clone()).await?;
+                handle_msg(src, msg, &mut pending_sessions, &mut sessions, &socket, bcast_addr, &task_sender).await?;
                 // TODO: grace period so we wait for all servers to ack
                 if sessions.is_empty() {
                     tracing::info!("completed all sessions!");
@@ -131,105 +129,9 @@ async fn dispatch_server_msgs(
     Ok(())
 }
 
-async fn handle_msg<'msg>(
-    src: SocketAddr,
-    msg: ServerMessage<'msg>,
-    pending: &mut HashMap<Nonce, (PathBuf, u64)>,
-    sessions: &mut HashMap<Identifier, (Arc<PathBuf>, u64)>,
-    socket: Arc<UdpSocket>,
-    bcast_addr: SocketAddr,
-    task_sender: mpsc::UnboundedSender<(JoinHandle<eyre::Result<()>>, String)>,
-) -> eyre::Result<()> {
-    macro_rules! try_send {
-        ($val:expr) => {
-            if task_sender.send($val).is_err() {
-                eyre::bail!("handles channel closed, main task terminated prematurely");
-            }
-        };
-    }
-
-    match msg {
-        ServerMessage::Ack { nonce, id } => {
-            if let Some((path, size)) = pending.remove(&nonce) {
-                tracing::info!(
-                    %nonce,
-                    %id,
-                    "file transfer session started"
-                );
-                let path = Arc::new(path);
-                let handle = tokio::spawn(send_all_chunks(
-                    Arc::clone(&path),
-                    size,
-                    Arc::clone(&socket),
-                    id,
-                    bcast_addr,
-                ));
-                sessions.insert(id, (path, size));
-                try_send!((handle, format!("send_all_chunks(id={id})")));
-            } else {
-                tracing::debug!(%nonce, "ignoring ack with unknown nonce");
-            }
-        }
-        ServerMessage::Nack { nonce, msg } => {
-            if pending.remove(&nonce).is_some() {
-                tracing::error!(msg, "server rejected file transfer");
-            } else {
-                tracing::debug!("ignoring nack with unknown nonce");
-            }
-        }
-        ServerMessage::Error { id, msg } => {
-            if sessions.remove(&id).is_some() {
-                tracing::error!(%id, msg, "remote server error, session terminated");
-            } else {
-                tracing::debug!(%id, msg, "ignoring server error for unknown session");
-            }
-        }
-        ServerMessage::Repeat { id, offsets } => {
-            if let Some((path, size)) = sessions.get(&id) {
-                tracing::debug!(
-                    %id,
-                    ?offsets,
-                    "got a request to repeat"
-                );
-                let cnt = offsets.len();
-                let handle = tokio::spawn(resend_chunks(
-                    Arc::clone(path),
-                    *size,
-                    Arc::clone(&socket),
-                    id,
-                    src,
-                    offsets,
-                ));
-                try_send!((
-                    handle,
-                    // giving it a semi-unique name for tracking
-                    format!("resend_chunks(id={id}, dst={src} cnt={cnt})",)
-                ));
-            } else {
-                tracing::debug!(%id, "ignoring repeat message for unknown session");
-            }
-        }
-        ServerMessage::Done { id } => {
-            if sessions.remove(&id).is_some() {
-                tracing::info!(%id, "session completed successfully");
-            } else {
-                tracing::debug!(
-                    %id,
-                    "ignoring unknown session completion"
-                );
-            }
-        }
-        ServerMessage::Announce(src) => {
-            tracing::trace!(src, "ignoring announce message");
-        }
-    }
-
-    Ok(())
-}
-
 async fn start_session(
     path: &Path,
-    socket: Arc<UdpSocket>,
+    socket: &UdpSocket,
     bcast_addr: SocketAddr,
 ) -> eyre::Result<(Nonce, u64)> {
     tracing::info!(path = %path.display(), %bcast_addr, "starting a broadcast file transfer");
@@ -243,6 +145,8 @@ async fn start_session(
         meta.len()
     };
 
+    // set to tokio's default `max_buf_size`
+    const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
     buf = Vec::with_capacity(size.min(CHUNK_SIZE) as usize);
 
     let hash: Hash = {
@@ -288,6 +192,102 @@ async fn start_session(
     socket.send_to(&start_msg, bcast_addr).await?;
 
     Ok((nonce, size))
+}
+
+async fn handle_msg(
+    src: SocketAddr,
+    msg: ServerMessage<'_>,
+    pending: &mut HashMap<Nonce, (PathBuf, u64)>,
+    sessions: &mut HashMap<Identifier, (Arc<PathBuf>, u64)>,
+    socket: &Arc<UdpSocket>,
+    bcast_addr: SocketAddr,
+    task_sender: &mpsc::UnboundedSender<(JoinHandle<eyre::Result<()>>, String)>,
+) -> eyre::Result<()> {
+    macro_rules! try_send {
+        ($val:expr) => {
+            if task_sender.send($val).is_err() {
+                eyre::bail!("handles channel closed, main task terminated prematurely");
+            }
+        };
+    }
+
+    match msg {
+        ServerMessage::Ack { nonce, id } => {
+            if let Some((path, size)) = pending.remove(&nonce) {
+                tracing::info!(
+                    %nonce,
+                    %id,
+                    "file transfer session started"
+                );
+                let path = Arc::new(path);
+                let handle = tokio::spawn(send_all_chunks(
+                    Arc::clone(&path),
+                    size,
+                    Arc::clone(socket),
+                    id,
+                    bcast_addr,
+                ));
+                sessions.insert(id, (path, size));
+                try_send!((handle, format!("send_all_chunks(id={id})")));
+            } else {
+                tracing::debug!(%nonce, "ignoring ack with unknown nonce");
+            }
+        }
+        ServerMessage::Nack { nonce, msg } => {
+            if pending.remove(&nonce).is_some() {
+                tracing::error!(msg, "server rejected file transfer");
+            } else {
+                tracing::debug!("ignoring nack with unknown nonce");
+            }
+        }
+        ServerMessage::Error { id, msg } => {
+            if sessions.remove(&id).is_some() {
+                tracing::error!(%id, msg, "remote server error, session terminated");
+            } else {
+                tracing::debug!(%id, msg, "ignoring server error for unknown session");
+            }
+        }
+        ServerMessage::Repeat { id, offsets } => {
+            if let Some((path, size)) = sessions.get(&id) {
+                tracing::debug!(
+                    %id,
+                    ?offsets,
+                    "got a request to repeat"
+                );
+                let cnt = offsets.len();
+                let handle = tokio::spawn(resend_chunks(
+                    Arc::clone(path),
+                    *size,
+                    Arc::clone(socket),
+                    id,
+                    src,
+                    offsets,
+                ));
+                try_send!((
+                    handle,
+                    // giving it a semi-unique name for tracking
+                    format!("resend_chunks(id={id}, dst={src} cnt={cnt})",)
+                ));
+            } else {
+                tracing::debug!(%id, "ignoring repeat message for unknown session");
+            }
+        }
+        ServerMessage::Done { id } => {
+            if sessions.remove(&id).is_some() {
+                tracing::info!(%id, "session completed successfully");
+            } else {
+                tracing::debug!(
+                    %id,
+                    "ignoring unknown session completion"
+                );
+            }
+        }
+        ServerMessage::Announce(src) => {
+            tracing::trace!(src, "ignoring announce message");
+        }
+    }
+
+    Ok(())
 }
 
 #[tracing::instrument(level = Level::DEBUG, skip(socket, id), fields(%id) err)]
