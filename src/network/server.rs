@@ -1,7 +1,7 @@
-use super::{addresses, create_socket, Hash, IpVersion, SocketMode};
-use crate::protocol::{ClientMessage, ServerMessage};
+use super::{addresses, create_socket, IpVersion, SocketMode};
+use crate::protocol::{ClientMessage, Hash, ServerMessage};
 use rand::Rng;
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, io, path::Path};
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -61,10 +61,16 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
                 hash,
                 path,
             } => {
+                let path = Path::new(path);
+                // let's make sure the ancestor directories exist...
+                // TODO: make sure there aren't any `..` in the path
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
                 let file = match open_opts.open(path).await {
                     Ok(file) => file,
                     Err(err) => {
-                        tracing::error!("failed to open file: {path}");
+                        tracing::error!("failed to open file: {}", path.display());
                         try_reply!(&ServerMessage::Nack {
                             nonce,
                             msg: &format!("failed to open file: {err}"),
@@ -83,6 +89,7 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
                 }
                 let id = rand::thread_rng().gen();
                 try_reply!(&ServerMessage::Ack { nonce, id });
+                tracing::info!(%id, path = %path.display(), %hash, size, "started a new file transfer session");
                 sessions.insert(
                     id,
                     FileEntry {
@@ -93,17 +100,22 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
                     },
                 );
             }
-            ClientMessage::Data { id, chunk, content } => {
+            ClientMessage::Data {
+                id,
+                offset,
+                content,
+            } => {
                 let Some(entry) = sessions.get_mut(&id) else {
-                    tracing::trace!("ignoring unknown session {id:#08x}");
+                    tracing::trace!(%id, offset, len = content.len(), "ignoring chunk for unknown session");
                     continue;
                 };
-                if let Err(err) = entry.file.seek(io::SeekFrom::Start(chunk)).await {
+                tracing::debug!(%id, offset, len = content.len(), "received a new chunk");
+                if let Err(err) = entry.file.seek(io::SeekFrom::Start(offset)).await {
                     tracing::error!(?err, "could not seek file, aborting session");
                     sessions.remove(&id);
                     try_reply!(&ServerMessage::Error {
                         id,
-                        msg: &format!("at chunk {chunk}, error seeking: {err}")
+                        msg: &format!("at chunk {offset}, error seeking: {err}")
                     });
                     continue;
                 }
@@ -112,15 +124,19 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
                     sessions.remove(&id);
                     try_reply!(&ServerMessage::Error {
                         id,
-                        msg: &format!("at chunk {chunk}, error writing: {err}")
+                        msg: &format!("at chunk {offset}, error writing: {err}")
                     });
                     continue;
                 }
+                tracing::trace!(%id, offset, "wrote chunk successfully");
                 entry.curr_size += content.len();
                 if entry.curr_size == entry.expected_size {
                     // TODO: check hash
-                    sessions.remove(&id);
+                    let entry = sessions
+                        .remove(&id)
+                        .expect("we hold a &mut so the entry must still be there");
                     try_reply!(&ServerMessage::Done { id });
+                    tracing::info!(%id, len = entry.curr_size, hash = %entry.hash, "file transfer completed");
                 }
                 // TODO: check missing chunks, ask for resends
             }

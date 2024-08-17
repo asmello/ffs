@@ -28,10 +28,11 @@ struct Args {
 #[derive(Debug, Clone, Subcommand)]
 enum Command {
     Serve {
+        /// Whether to allow overwriting existing files.
+        #[arg(long)]
+        overwrite: bool,
         /// Name of this server for advertisement.
         name: Option<String>,
-        /// Whether to allow overwriting existing files.
-        overwrite: bool,
     },
     Send {
         #[arg(short, long)]
@@ -47,6 +48,7 @@ fn init() {
             .with(console_subscriber::spawn())
             .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_default_env()))
             .init();
+        tracing::info!("tokio-console enabled");
     } else {
         tracing_subscriber::fmt::init();
     }
