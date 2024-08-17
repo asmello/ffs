@@ -10,7 +10,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::HashMap,
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -23,7 +23,7 @@ use tokio::{
     sync::mpsc,
     task::{JoinHandle, JoinSet},
 };
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
@@ -38,34 +38,89 @@ const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 pub async fn send_to_all(ip_version: IpVersion, path: &Path) -> eyre::Result<()> {
     let addr = addresses(ip_version);
     let socket = Arc::new(create_socket(addr.send, SocketMode::Send)?);
-    let mut files = FileGenerator::new(path);
-    let mut tasks = JoinSet::new();
-    let mut error_count = 0;
+    let mut tasks = Vec::new();
 
-    while let Some(file) = files.next().await {
-        let file = match file {
-            Ok(file) => file,
-            Err(err) => {
-                tracing::error!(?err, "filesystem io error");
-                error_count += 1;
-                continue;
+    let mut task_rx = {
+        let (task_tx, task_rx) = mpsc::unbounded_channel();
+        // TODO: non-empty stream!
+        let handle = tokio::spawn(dispatch_server_msgs(
+            socket,
+            addr.recv,
+            FileGenerator::new(path).into_stream(),
+            task_tx,
+        ));
+        tasks.push((handle, "dispatch_server_msgs".into()));
+        task_rx
+    };
+
+    while let Some((handle, ref name)) = tasks.last_mut() {
+        tokio::select! {
+            // NOTE: this arm will be disabled when the channel closes
+            Some(task) = task_rx.recv() => {
+                tasks.push(task);
             }
-        };
-        tasks.spawn(send_file_to_all(file, Arc::clone(&socket), addr.recv));
+            r = handle => {
+                match r {
+                    Ok(Ok(())) => {
+                        tracing::debug!("task {name} completed successfully");
+                    }
+                    Ok(Err(err)) => {
+                        tracing::error!(?err, "task {name} terminated unsuccesfully");
+                    }
+                    Err(join_err) => {
+                        if join_err.is_cancelled() {
+                            continue;
+                        }
+                        std::panic::resume_unwind(join_err.into_panic());
+                    }
+                }
+                tasks.pop();
+            }
+        }
     }
 
-    while let Some(r) = tasks.join_next().await {
-        match r {
-            Ok(Ok(())) => (),
-            Ok(Err(err)) => {
-                tracing::error!(?err, "send task terminated unsuccesfully");
-                error_count += 1;
+    Ok(())
+}
+
+// NOTE: this task must be the exclusive reader of the socket
+async fn dispatch_server_msgs(
+    socket: Arc<UdpSocket>,
+    bcast_addr: SocketAddr,
+    paths: impl Stream<Item = io::Result<PathBuf>>,
+    task_sender: mpsc::UnboundedSender<(JoinHandle<eyre::Result<()>>, String)>,
+) -> eyre::Result<()> {
+    tokio::pin!(paths);
+    let mut error_count = 0;
+    let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
+    let mut pending_sessions = HashMap::new();
+    let mut sessions = HashMap::new();
+    loop {
+        buf.clear();
+        tokio::select! {
+            // NOTE: arm will be *disabled* when paths is exhausted
+            Some(r) = paths.next() => {
+                let path = match r {
+                    Ok(path) => path,
+                    Err(err) => {
+                        tracing::error!(?err, "filesystem io error");
+                        error_count += 1;
+                        continue;
+                    }
+                };
+                let (nonce, size) = start_session(&path, Arc::clone(&socket), bcast_addr).await?;
+                pending_sessions.insert(nonce, (path, size));
             }
-            Err(join_err) => {
-                if let Ok(reason) = join_err.try_into_panic() {
-                    std::panic::resume_unwind(reason);
-                } else {
-                    // task cancelled
+            r = socket.recv_buf_from(&mut buf) => {
+                let (_, src) = r?;
+                let Ok(msg) = bitcode::decode::<ServerMessage>(&buf) else {
+                    tracing::error!(?buf, "received invalid message");
+                    continue;
+                };
+                handle_msg(src, msg, &mut pending_sessions, &mut sessions, Arc::clone(&socket), bcast_addr, task_sender.clone()).await?;
+                // TODO: grace period so we wait for all servers to ack
+                if sessions.is_empty() {
+                    tracing::info!("completed all sessions!");
+                    break;
                 }
             }
         }
@@ -76,119 +131,15 @@ pub async fn send_to_all(ip_version: IpVersion, path: &Path) -> eyre::Result<()>
     Ok(())
 }
 
-#[tracing::instrument(level = Level::DEBUG, skip_all, fields(?path), err)]
-async fn send_file_to_all(
-    path: PathBuf,
+async fn handle_msg<'msg>(
+    src: SocketAddr,
+    msg: ServerMessage<'msg>,
+    pending: &mut HashMap<Nonce, (PathBuf, u64)>,
+    sessions: &mut HashMap<Identifier, (Arc<PathBuf>, u64)>,
     socket: Arc<UdpSocket>,
-    bcast: SocketAddr,
-) -> eyre::Result<()> {
-    // making sure we drop our sender so as to not keep the channel open
-    let mut task_rx = {
-        let (task_tx, task_rx) = mpsc::unbounded_channel();
-        let handler_task = tokio::spawn(file_broadcast_protocol(
-            path,
-            Arc::clone(&socket),
-            bcast,
-            task_tx.clone(),
-        ));
-        // easier to not special case this one
-        task_tx.send((handler_task, "file_broadcast_protocol".into()))?;
-
-        task_rx
-    };
-
-    while let Some((handle, name)) = task_rx.recv().await {
-        match handle.await {
-            Ok(Ok(())) => {
-                tracing::trace!("completed task {name}");
-            }
-            Ok(Err(err)) => {
-                tracing::error!(?err, "task terminated unsuccesfully");
-            }
-            Err(join_err) => {
-                if join_err.is_cancelled() {
-                    continue;
-                }
-                std::panic::resume_unwind(join_err.into_panic());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[tracing::instrument(level = Level::DEBUG, skip_all, fields(?path, bcast), err)]
-async fn file_broadcast_protocol(
-    path: PathBuf,
-    socket: Arc<UdpSocket>,
-    bcast: SocketAddr,
+    bcast_addr: SocketAddr,
     task_sender: mpsc::UnboundedSender<(JoinHandle<eyre::Result<()>>, String)>,
 ) -> eyre::Result<()> {
-    tracing::info!(path = %path.display(), bcast_addr = %bcast, "initiating a broadcast file transfer");
-
-    let nonce = rand::thread_rng().gen();
-    let mut buf;
-
-    // setup stage
-    let size = {
-        let mut file = tokio::fs::File::open(&path).await?;
-        let size = {
-            let meta = file.metadata().await?;
-            meta.len()
-        };
-
-        buf = Vec::with_capacity(size.min(CHUNK_SIZE) as usize);
-
-        let hash: Hash = {
-            // scan the file once to compute its hash
-            // TODO: is there a better way?
-            let mut hasher = Sha256::new();
-            let mut bytes_read = 0;
-            loop {
-                let n = file.read_buf(&mut buf).await?;
-                hasher.update(&buf);
-                bytes_read += n;
-                if bytes_read >= size as usize {
-                    break;
-                }
-                buf.clear();
-            }
-            file.rewind().await?;
-            hasher
-                .finalize()
-                .to_vec()
-                .try_into()
-                .expect("sha256 has 32 bytes exactly")
-        };
-
-        // send start message
-        let start_msg = {
-            let path = path
-                .as_os_str()
-                .to_str()
-                .ok_or_else(|| eyre::eyre!("not a valid utf-8 path: {path:?}"))?;
-
-            tracing::debug!(%nonce, %path, size, %hash, "sending start message");
-            let msg = ClientMessage::Start {
-                nonce,
-                size,
-                hash,
-                path,
-            };
-
-            bitcode::encode(&msg)
-        };
-
-        socket.send_to(&start_msg, bcast).await?;
-
-        size
-    };
-
-    tracing::trace!(
-        %nonce,
-        "waiting for any server to acknowledge our transfer"
-    );
-
     macro_rules! try_send {
         ($val:expr) => {
             if task_sender.send($val).is_err() {
@@ -197,109 +148,146 @@ async fn file_broadcast_protocol(
         };
     }
 
-    let path = Arc::new(path);
-    let mut sessions = HashSet::new();
-    loop {
-        buf.clear();
-        let (_, srv_addr) = socket.recv_buf_from(&mut buf).await?;
-        let Ok(msg) = bitcode::decode::<ServerMessage>(&buf) else {
-            tracing::error!(?buf, "received invalid message");
-            continue;
-        };
-
-        match msg {
-            ServerMessage::Ack {
-                nonce: server_nonce,
-                id,
-            } => {
-                if server_nonce != nonce {
-                    tracing::debug!(
-                        "ignoring mismatched ack from server. \
-                            expected nonce {nonce} but got {server_nonce}"
-                    );
-                    continue;
-                }
+    match msg {
+        ServerMessage::Ack { nonce, id } => {
+            if let Some((path, size)) = pending.remove(&nonce) {
                 tracing::info!(
                     %nonce,
                     %id,
                     "file transfer session started"
                 );
-                sessions.insert(id);
+                let path = Arc::new(path);
                 let handle = tokio::spawn(send_all_chunks(
                     Arc::clone(&path),
                     size,
                     Arc::clone(&socket),
                     id,
-                    bcast,
+                    bcast_addr,
                 ));
+                sessions.insert(id, (path, size));
                 try_send!((handle, format!("send_all_chunks(id={id})")));
+            } else {
+                tracing::debug!(%nonce, "ignoring ack with unknown nonce");
             }
-            ServerMessage::Nack {
-                nonce: server_nonce,
-                msg,
-            } => {
-                if server_nonce != nonce {
-                    tracing::debug!(
-                        "ignoring mismatched nack from server. \
-                            expected nonce {nonce} but got {server_nonce}"
-                    );
-                    continue;
-                }
+        }
+        ServerMessage::Nack { nonce, msg } => {
+            if pending.remove(&nonce).is_some() {
                 tracing::error!(msg, "server rejected file transfer");
+            } else {
+                tracing::debug!("ignoring nack with unknown nonce");
             }
-            ServerMessage::Error { id, msg } => {
-                if sessions.remove(&id) {
-                    tracing::error!(%id, msg, "remote server error, session terminated");
-                } else {
-                    tracing::debug!(%id, msg, "ignoring server error for unknown session");
-                }
+        }
+        ServerMessage::Error { id, msg } => {
+            if sessions.remove(&id).is_some() {
+                tracing::error!(%id, msg, "remote server error, session terminated");
+            } else {
+                tracing::debug!(%id, msg, "ignoring server error for unknown session");
             }
-            ServerMessage::Repeat { id, offsets } => {
-                if sessions.contains(&id) {
-                    tracing::debug!(
-                        %id,
-                        ?offsets,
-                        "got a request to repeat"
-                    );
-                    let cnt = offsets.len();
-                    let handle = tokio::spawn(resend_chunks(
-                        Arc::clone(&path),
-                        size,
-                        Arc::clone(&socket),
-                        id,
-                        srv_addr,
-                        offsets,
-                    ));
-                    try_send!((
-                        handle,
-                        // giving it a semi-unique name for tracking
-                        format!("resend_chunks(id={id}, dst={srv_addr} cnt={cnt})",)
-                    ));
-                } else {
-                    tracing::debug!(%id, "ignoring repeat message for unknown session");
-                }
+        }
+        ServerMessage::Repeat { id, offsets } => {
+            if let Some((path, size)) = sessions.get(&id) {
+                tracing::debug!(
+                    %id,
+                    ?offsets,
+                    "got a request to repeat"
+                );
+                let cnt = offsets.len();
+                let handle = tokio::spawn(resend_chunks(
+                    Arc::clone(path),
+                    *size,
+                    Arc::clone(&socket),
+                    id,
+                    src,
+                    offsets,
+                ));
+                try_send!((
+                    handle,
+                    // giving it a semi-unique name for tracking
+                    format!("resend_chunks(id={id}, dst={src} cnt={cnt})",)
+                ));
+            } else {
+                tracing::debug!(%id, "ignoring repeat message for unknown session");
             }
-            ServerMessage::Done { id } => {
-                if sessions.remove(&id) {
-                    tracing::info!(%id, "session completed successfully");
-                    if sessions.is_empty() {
-                        tracing::info!("all sessions completed!");
-                        break;
-                    }
-                } else {
-                    tracing::debug!(
-                        %id,
-                        "ignoring unknown session completion"
-                    );
-                }
+        }
+        ServerMessage::Done { id } => {
+            if sessions.remove(&id).is_some() {
+                tracing::info!(%id, "session completed successfully");
+            } else {
+                tracing::debug!(
+                    %id,
+                    "ignoring unknown session completion"
+                );
             }
-            ServerMessage::Announce(src) => {
-                tracing::trace!(src, "ignoring announce message");
-            }
+        }
+        ServerMessage::Announce(src) => {
+            tracing::trace!(src, "ignoring announce message");
         }
     }
 
     Ok(())
+}
+
+async fn start_session(
+    path: &Path,
+    socket: Arc<UdpSocket>,
+    bcast_addr: SocketAddr,
+) -> eyre::Result<(Nonce, u64)> {
+    tracing::info!(path = %path.display(), %bcast_addr, "starting a broadcast file transfer");
+
+    let nonce = rand::thread_rng().gen();
+    let mut buf;
+
+    let mut file = tokio::fs::File::open(&path).await?;
+    let size = {
+        let meta = file.metadata().await?;
+        meta.len()
+    };
+
+    buf = Vec::with_capacity(size.min(CHUNK_SIZE) as usize);
+
+    let hash: Hash = {
+        // scan the file once to compute its hash
+        // TODO: is there a better way?
+        let mut hasher = Sha256::new();
+        let mut bytes_read = 0;
+        loop {
+            let n = file.read_buf(&mut buf).await?;
+            hasher.update(&buf);
+            bytes_read += n;
+            if bytes_read >= size as usize {
+                break;
+            }
+            buf.clear();
+        }
+        file.rewind().await?;
+        hasher
+            .finalize()
+            .to_vec()
+            .try_into()
+            .expect("sha256 has 32 bytes exactly")
+    };
+
+    // send start message
+    let start_msg = {
+        let path = path
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("not a valid utf-8 path: {path:?}"))?;
+
+        tracing::debug!(%nonce, %path, size, %hash, "sending start message");
+        let msg = ClientMessage::Start {
+            nonce,
+            size,
+            hash,
+            path,
+        };
+
+        bitcode::encode(&msg)
+    };
+
+    socket.send_to(&start_msg, bcast_addr).await?;
+
+    Ok((nonce, size))
 }
 
 #[tracing::instrument(level = Level::DEBUG, skip(socket, id), fields(%id) err)]
@@ -320,6 +308,7 @@ async fn send_all_chunks(
     loop {
         tracing::trace!(offset, "sending a chunk");
         let sent = send_chunk(&mut file, &socket, &mut buf, id, offset, dst).await?;
+        tracing::trace!("sent {sent} bytes");
         if sent == 0 {
             tracing::warn!("no data sent this iteration, assuming all chunks have been sent");
             break;
@@ -358,7 +347,6 @@ async fn resend_chunks(
 ) -> eyre::Result<()> {
     // we reopen the file so we can seek independently
     let mut file = tokio::fs::File::open(path.as_ref()).await?;
-
     let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
 
     for offset in offsets {
@@ -389,16 +377,49 @@ async fn send_chunk(
     dst: SocketAddr,
 ) -> eyre::Result<u64> {
     buf.clear();
-    let n = file.read_buf(buf).await?;
+    // :sigh: so read_buf gives no guarantees about whether it will fill up the
+    // buffer or not. it often doesn't, in practice. we could use `read_exact`
+    // instead, but then there are no guarantees about what happens if the EOF
+    // is reached while attempting to fill up the buffer. so to be on the safe
+    // side, we fill up the buffer manually until either the buffer is filled or
+    // the file runs out of bytes.
+    // TODO: it seems we often only fetch 64 bytes or lessat a time, which
+    // is not a lot. could actually be faster to do this using synchronous
+    // i/o instead.
+    let mut read = 0;
+    loop {
+        let n = file.read_buf(buf).await?;
+        read += n;
+        if buf.len() == buf.capacity() || n == 0 {
+            break;
+        }
+    }
+
     let payload = bitcode::encode(&ClientMessage::Data {
         id,
         offset,
-        content: std::mem::take(buf),
+        // why not `std::mem::take`? because that resets the capacity to 0!
+        content: buf.clone(),
     });
-    socket.send_to(&payload, dst).await?;
-    // cast safe as buf will be sized `DATAGRAM_SIZE_LIMIT`,
-    // which has to fit in a u16 per the IP spec
-    Ok(n as u64)
+    tracing::trace!("sending a payload of length {}", payload.len());
+    // TODO: alas, due to serialization overhead we may actually exceed the
+    // datagram payload limit here, leading to fragmentation (or an outright
+    // failure in the worst case). to avoid that unfortunately we'll have to
+    // drop bitcode and use our own encoding/decoding logic, as we need the
+    // overhead to be predictable so we can account for it. this should also
+    // make our protocol more portable to other languages.
+    let sent = socket.send_to(&payload, dst).await?;
+    eyre::ensure!(
+        sent == payload.len(),
+        "sent {sent} bytes but expected to send {}",
+        payload.len()
+    );
+    // cast safe as buf will be sized `DATAGRAM_SIZE_LIMIT`, which has to fit
+    // in a u16 per the IP spec. well, actually there's also a serialization
+    // overhead that may make the payload exceed that a bit, but definitely
+    // not enough to be of concern. once we implement the TODO above we can be
+    // strict about this limit.
+    Ok(read as u64)
 }
 
 pub async fn send_interactive(ip_version: IpVersion, _path: &Path) {
