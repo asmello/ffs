@@ -8,7 +8,8 @@ edition = "2021"
 tokio-console = ["tokio/tracing"]
 
 [dependencies]
-bitcode = "0.6.3"
+bytemuck = "1.17.0"
+byteorder = "1.5.0"
 clap = { version = "4.5.15", features = ["derive"] }
 console-subscriber = "0.4.0"
 crossterm = { version = "0.28.1", features = ["event-stream"] }

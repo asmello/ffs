@@ -1,7 +1,7 @@
 use super::{addresses, create_socket, IpVersion, SocketMode};
 use crate::protocol::{ClientMessage, Hash, ServerMessage};
 use rand::Rng;
-use std::{collections::HashMap, io, path::Path};
+use std::{cmp::Ordering, collections::HashMap, io, path::Path};
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -9,7 +9,7 @@ use tokio::{
 
 struct FileEntry {
     file: File,
-    hash: Hash,
+    hash: Hash<'static>,
     curr_size: usize,
     expected_size: usize,
 }
@@ -28,21 +28,24 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
     }
 
     let mut sessions = HashMap::new();
-    let mut buf = Vec::with_capacity(65535);
+    let mut read_buf = Vec::with_capacity(65535);
+    let mut write_buf = Vec::new();
 
     tracing::info!("listening on {local_addr:?}");
 
     loop {
-        buf.clear();
-        let (_, addr) = listen_socket.recv_buf_from(&mut buf).await?;
-        let Ok(msg) = bitcode::decode(&buf) else {
-            tracing::error!(?buf, "invalid message received");
+        read_buf.clear();
+        let (_, addr) = listen_socket.recv_buf_from(&mut read_buf).await?;
+        let Ok(msg) = ClientMessage::decode(&read_buf) else {
+            tracing::error!(?read_buf, "invalid message received");
             continue;
         };
 
         macro_rules! try_reply {
             ($msg:expr) => {
-                if let Err(err) = send_socket.send_to(&bitcode::encode($msg), addr).await {
+                write_buf.clear();
+                $msg.encode(&mut write_buf).expect("vec grows as needed");
+                if let Err(err) = send_socket.send_to(&write_buf, addr).await {
                     tracing::error!(?err, "failed to send message");
                     continue;
                 }
@@ -51,9 +54,7 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
 
         match msg {
             ClientMessage::Discover => {
-                let announce_msg = ServerMessage::Announce(name);
-                let payload = bitcode::encode(&announce_msg);
-                send_socket.send_to(&payload, addr).await?;
+                try_reply!(ServerMessage::Announce(name));
             }
             ClientMessage::Start {
                 nonce,
@@ -71,7 +72,7 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
                     Ok(file) => file,
                     Err(err) => {
                         tracing::error!("failed to open file: {}", path.display());
-                        try_reply!(&ServerMessage::Nack {
+                        try_reply!(ServerMessage::Nack {
                             nonce,
                             msg: &format!("failed to open file: {err}"),
                         });
@@ -81,20 +82,20 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
                 // TODO: can we skip this? docs say seek past end is UB...
                 if let Err(err) = file.set_len(size).await {
                     tracing::error!(?err, "could not pre-allocate file");
-                    try_reply!(&ServerMessage::Nack {
+                    try_reply!(ServerMessage::Nack {
                         nonce,
                         msg: &format!("failed to pre-allocate file: {err}"),
                     });
                     continue;
                 }
                 let id = rand::thread_rng().gen();
-                try_reply!(&ServerMessage::Ack { nonce, id });
+                try_reply!(ServerMessage::Ack { nonce, id });
                 tracing::info!(%id, path = %path.display(), %hash, size, "started a new file transfer session");
                 sessions.insert(
                     id,
                     FileEntry {
                         file,
-                        hash,
+                        hash: hash.into_owned(),
                         curr_size: 0,
                         expected_size: size as usize,
                     },
@@ -103,40 +104,72 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
             ClientMessage::Data {
                 id,
                 offset,
-                content,
+                mut content,
             } => {
                 let Some(entry) = sessions.get_mut(&id) else {
                     tracing::trace!(%id, offset, len = content.len(), "ignoring chunk for unknown session");
                     continue;
                 };
-                tracing::debug!(%id, offset, len = content.len(), "received a new chunk");
+                tracing::debug!(
+                    %id,
+                    offset,
+                    len = content.len(),
+                    rem = entry.expected_size - entry.curr_size - content.len(),
+                    "received a new chunk"
+                );
                 if let Err(err) = entry.file.seek(io::SeekFrom::Start(offset)).await {
                     tracing::error!(?err, "could not seek file, aborting session");
                     sessions.remove(&id);
-                    try_reply!(&ServerMessage::Error {
+                    try_reply!(ServerMessage::Error {
                         id,
                         msg: &format!("at chunk {offset}, error seeking: {err}")
                     });
                     continue;
                 }
-                if let Err(err) = entry.file.write_all_buf(&mut content.as_slice()).await {
+                let len = content.len();
+                if let Err(err) = entry.file.write_all_buf(&mut content).await {
                     tracing::error!(?err, "could not write chunk, aborting session");
                     sessions.remove(&id);
-                    try_reply!(&ServerMessage::Error {
+                    try_reply!(ServerMessage::Error {
                         id,
                         msg: &format!("at chunk {offset}, error writing: {err}")
                     });
                     continue;
                 }
                 tracing::trace!(%id, offset, "wrote chunk successfully");
-                entry.curr_size += content.len();
-                if entry.curr_size == entry.expected_size {
-                    // TODO: check hash
-                    let entry = sessions
-                        .remove(&id)
-                        .expect("we hold a &mut so the entry must still be there");
-                    try_reply!(&ServerMessage::Done { id });
-                    tracing::info!(%id, len = entry.curr_size, hash = %entry.hash, "file transfer completed");
+                entry.curr_size += len;
+                match entry.curr_size.cmp(&entry.expected_size) {
+                    Ordering::Less => {
+                        tracing::trace!(
+                            "remaining bytes: {}",
+                            entry.expected_size - entry.curr_size
+                        );
+                    }
+                    Ordering::Equal => {
+                        // TODO: check hash
+                        let entry = sessions
+                            .remove(&id)
+                            .expect("we hold a &mut so the entry must still be there");
+                        try_reply!(ServerMessage::Done { id });
+                        tracing::info!(%id, len = entry.curr_size, hash = %entry.hash, "file transfer completed");
+                    }
+                    Ordering::Greater => {
+                        tracing::error!(
+                            recv = entry.curr_size,
+                            expected = entry.expected_size,
+                            "received more data than expected"
+                        );
+                        let entry = sessions
+                            .remove(&id)
+                            .expect("we hold a &mut so the entry must still be there");
+                        try_reply!(ServerMessage::Error {
+                            id,
+                            msg: &format!(
+                                "payload overflow: received {} bytes, expected {}",
+                                entry.curr_size, entry.expected_size
+                            )
+                        });
+                    }
                 }
                 // TODO: check missing chunks, ask for resends
             }

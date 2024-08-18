@@ -25,7 +25,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::Instant,
 };
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
@@ -125,8 +125,18 @@ async fn dispatch_server_msgs(
         let grace_end = grace.end();
         tokio::select! {
             // track when the grace period expires
-            _ = tokio::time::sleep_until(grace_end.unwrap()), if grace_end.is_some() => {
+            _ = async { tokio::time::sleep_until(grace_end.unwrap()).await }, if grace_end.is_some() => {
+                tracing::trace!("grace period ended");
                 grace = Grace::Ended;
+                if sessions.is_empty() {
+                    tracing::info!("completed all sessions");
+                    break;
+                } else {
+                    tracing::trace!(
+                        sessions = ?sessions.keys().collect::<Vec<_>>(),
+                        "there are still active sessions"
+                    );
+                }
             }
             // NOTE: arm will be *disabled* when paths is exhausted
             Some(r) = paths.next() => {
@@ -140,12 +150,14 @@ async fn dispatch_server_msgs(
                 };
                 let (nonce, size) = start_session(&path, &socket, bcast_addr).await?;
                 // every new session we start renews the grace period
-                grace = Grace::Started { end_at: Instant::now() + grace_period };
+                let end_at = Instant::now() + grace_period;
+                tracing::trace!(?end_at, "grace period renewed");
+                grace = Grace::Started { end_at  };
                 pending_sessions.insert(nonce, (path, size));
             }
             r = socket.recv_buf_from(&mut buf) => {
                 let (_, src) = r?;
-                let Ok(msg) = bitcode::decode::<ServerMessage>(&buf) else {
+                let Ok(msg) = ServerMessage::decode(&buf) else {
                     tracing::error!(?buf, "received invalid message");
                     continue;
                 };
@@ -162,12 +174,14 @@ async fn dispatch_server_msgs(
                 if sessions.is_empty() && matches!(grace, Grace::Ended) {
                     tracing::info!("completed all sessions!");
                     break;
+                } else if sessions.is_empty() {
+                    tracing::debug!("sessions empty but grace period hasn't ended yet");
                 }
             }
         }
     }
 
-    eyre::ensure!(error_count == 0, "{error_count} file(s) could not be sent");
+    eyre::ensure!(error_count == 0, "{error_count} error(s) detected");
 
     Ok(())
 }
@@ -215,24 +229,24 @@ async fn start_session(
     };
 
     // send start message
-    let start_msg = {
-        let path = path
-            .as_os_str()
-            .to_str()
-            .ok_or_else(|| eyre::eyre!("not a valid utf-8 path: {path:?}"))?;
+    let path = path
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("not a valid utf-8 path: {path:?}"))?;
 
-        tracing::debug!(%nonce, %path, size, %hash, "sending start message");
-        let msg = ClientMessage::Start {
-            nonce,
-            size,
-            hash,
-            path,
-        };
+    tracing::debug!(%nonce, %path, size, %hash, "sending start message");
 
-        bitcode::encode(&msg)
-    };
+    buf.clear();
+    ClientMessage::Start {
+        nonce,
+        size,
+        hash,
+        path,
+    }
+    .encode(&mut buf)
+    .expect("vec grows as needed");
 
-    socket.send_to(&start_msg, bcast_addr).await?;
+    socket.send_to(&buf, bcast_addr).await?;
 
     Ok((nonce, size))
 }
@@ -304,7 +318,7 @@ async fn handle_msg(
                     Arc::clone(socket),
                     id,
                     src,
-                    offsets,
+                    offsets.to_vec(),
                 ));
                 try_send!((
                     handle,
@@ -344,10 +358,10 @@ async fn send_all_chunks(
     // we reopen the file so we can seek independently
     let mut file = tokio::fs::File::open(path.as_ref()).await?;
 
-    // holds chunks, which can only grow as large as a datagram payload.
+    // total size = tag (1 byte) + id (8 bytes) + offset (8 bytes) + content
     let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
-    let mut offset = 0;
 
+    let mut offset = 0;
     loop {
         tracing::trace!(offset, "sending a chunk");
         let sent = send_chunk(&mut file, &socket, &mut buf, id, offset, dst).await?;
@@ -390,6 +404,8 @@ async fn resend_chunks(
 ) -> eyre::Result<()> {
     // we reopen the file so we can seek independently
     let mut file = tokio::fs::File::open(path.as_ref()).await?;
+
+    // total size = tag (1 byte) + id (8 bytes) + offset (8 bytes) + content (read bytes)
     let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
 
     for offset in offsets {
@@ -419,49 +435,26 @@ async fn send_chunk(
     offset: u64,
     dst: SocketAddr,
 ) -> eyre::Result<u64> {
-    buf.clear();
-    // :sigh: so read_buf gives no guarantees about whether it will fill up the
-    // buffer or not. it often doesn't, in practice. we could use `read_exact`
-    // instead, but then there are no guarantees about what happens if the EOF
-    // is reached while attempting to fill up the buffer. so to be on the safe
-    // side, we fill up the buffer manually until either the buffer is filled or
-    // the file runs out of bytes.
-    // TODO: it seems we often only fetch 64 bytes or lessat a time, which
-    // is not a lot. could actually be faster to do this using synchronous
-    // i/o instead.
-    let mut read = 0;
-    loop {
-        let n = file.read_buf(buf).await?;
-        read += n;
-        if buf.len() == buf.capacity() || n == 0 {
-            break;
-        }
-    }
+    debug_assert!(buf.capacity() == DATAGRAM_SIZE_LIMIT);
 
-    let payload = bitcode::encode(&ClientMessage::Data {
-        id,
-        offset,
-        // why not `std::mem::take`? because that resets the capacity to 0!
-        content: buf.clone(),
-    });
-    tracing::trace!("sending a payload of length {}", payload.len());
-    // TODO: alas, due to serialization overhead we may actually exceed the
-    // datagram payload limit here, leading to fragmentation (or an outright
-    // failure in the worst case). to avoid that unfortunately we'll have to
-    // drop bitcode and use our own encoding/decoding logic, as we need the
-    // overhead to be predictable so we can account for it. this should also
-    // make our protocol more portable to other languages.
-    let sent = socket.send_to(&payload, dst).await?;
-    eyre::ensure!(
-        sent == payload.len(),
-        "sent {sent} bytes but expected to send {}",
-        payload.len()
+    buf.clear();
+    let read = ClientMessage::encode_data_msg(id, offset, file, buf).await?;
+
+    tracing::trace!(
+        payload_len = read,
+        "sending a message of length {}",
+        buf.len()
     );
+
+    let sent = socket.send_to(buf, dst).await?;
+    eyre::ensure!(
+        sent == buf.len(),
+        "sent {sent} bytes but expected to send {}",
+        buf.len()
+    );
+
     // cast safe as buf will be sized `DATAGRAM_SIZE_LIMIT`, which has to fit
-    // in a u16 per the IP spec. well, actually there's also a serialization
-    // overhead that may make the payload exceed that a bit, but definitely
-    // not enough to be of concern. once we implement the TODO above we can be
-    // strict about this limit.
+    // in a u16 per the IP spec.
     Ok(read as u64)
 }
 
@@ -496,16 +489,18 @@ pub async fn send_interactive(ip_version: IpVersion, _path: &Path) {
 async fn network_loop(ip_version: IpVersion, cancel: CancellationToken) -> eyre::Result<()> {
     let addr = addresses(ip_version);
     let socket = create_socket(addr.send, SocketMode::Send)?;
-
-    let discover_msg = bitcode::encode(&ClientMessage::Discover);
-    socket.send_to(&discover_msg, addr.recv).await?;
-
     let mut buf = Vec::with_capacity(65536);
+
+    ClientMessage::Discover
+        .encode(&mut buf)
+        .expect("vec grows as needed");
+    socket.send_to(&buf, addr.recv).await?;
+
     loop {
         tokio::select! {
             r = socket.recv_buf_from(&mut buf) => {
                 let (_, addr) = r?;
-                let msg: ServerMessage = bitcode::decode(&buf)?;
+                let msg = ServerMessage::decode(&buf)?;
                 handle_message(addr, msg);
                 buf.clear();
             }
@@ -520,19 +515,7 @@ async fn network_loop(ip_version: IpVersion, cancel: CancellationToken) -> eyre:
 }
 
 fn handle_message(src: SocketAddr, msg: ServerMessage) {
-    match msg {
-        ServerMessage::Announce(name) => {
-            tracing::info!(addr = %src, "discovered server: {name}");
-        }
-        ServerMessage::Ack { nonce, id } => todo!(),
-        ServerMessage::Nack { nonce, msg } => todo!(),
-        ServerMessage::Error { id, msg } => todo!(),
-        ServerMessage::Repeat {
-            id,
-            offsets: chunks,
-        } => todo!(),
-        ServerMessage::Done { id } => todo!(),
-    }
+    todo!()
 }
 
 async fn tui_loop(cancel: CancellationToken) -> eyre::Result<()> {
