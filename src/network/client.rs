@@ -15,6 +15,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     fs::File,
@@ -22,6 +23,7 @@ use tokio::{
     net::UdpSocket,
     sync::mpsc,
     task::{JoinHandle, JoinSet},
+    time::Instant,
 };
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -33,18 +35,22 @@ use tracing::Level;
 // re-send rate (as even one fragment lost invalidates the entire datagram).
 const DATAGRAM_SIZE_LIMIT: usize = 1452;
 
-pub async fn send_to_all(ip_version: IpVersion, path: &Path) -> eyre::Result<()> {
+pub async fn send_to_all(
+    ip_version: IpVersion,
+    path: &Path,
+    grace_period: Duration,
+) -> eyre::Result<()> {
     let mut tasks = Vec::new();
     let mut task_rx = {
         let addr = addresses(ip_version);
         let socket = create_socket(addr.send, SocketMode::Send)?;
         let (task_tx, task_rx) = mpsc::unbounded_channel();
-        // TODO: non-empty stream!
         let handle = tokio::spawn(dispatch_server_msgs(
             socket,
             addr.recv,
-            FileGenerator::new(path).into_stream(),
+            FileGenerator::new(path),
             task_tx,
+            grace_period,
         ));
         tasks.push((handle, "dispatch_server_msgs".into()));
         task_rx
@@ -79,14 +85,36 @@ pub async fn send_to_all(ip_version: IpVersion, path: &Path) -> eyre::Result<()>
     Ok(())
 }
 
+#[derive(Debug, Default)]
+enum Grace {
+    #[default]
+    Waiting,
+    Started {
+        end_at: Instant,
+    },
+    Ended,
+}
+
+impl Grace {
+    fn end(&self) -> Option<Instant> {
+        match self {
+            Grace::Waiting => None,
+            Grace::Started { end_at } => Some(*end_at),
+            Grace::Ended => None,
+        }
+    }
+}
+
 // NOTE: this task must be the exclusive reader of the socket
 async fn dispatch_server_msgs(
     socket: UdpSocket,
     bcast_addr: SocketAddr,
-    paths: impl Stream<Item = io::Result<PathBuf>>,
+    paths: FileGenerator,
     task_sender: mpsc::UnboundedSender<(JoinHandle<eyre::Result<()>>, String)>,
+    grace_period: Duration,
 ) -> eyre::Result<()> {
     let socket = Arc::new(socket);
+    let mut grace = Grace::default();
     let mut error_count = 0;
     let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
     let mut pending_sessions = HashMap::new();
@@ -94,7 +122,12 @@ async fn dispatch_server_msgs(
     tokio::pin!(paths);
     loop {
         buf.clear();
+        let grace_end = grace.end();
         tokio::select! {
+            // track when the grace period expires
+            _ = tokio::time::sleep_until(grace_end.unwrap()), if grace_end.is_some() => {
+                grace = Grace::Ended;
+            }
             // NOTE: arm will be *disabled* when paths is exhausted
             Some(r) = paths.next() => {
                 let path = match r {
@@ -106,6 +139,8 @@ async fn dispatch_server_msgs(
                     }
                 };
                 let (nonce, size) = start_session(&path, &socket, bcast_addr).await?;
+                // every new session we start renews the grace period
+                grace = Grace::Started { end_at: Instant::now() + grace_period };
                 pending_sessions.insert(nonce, (path, size));
             }
             r = socket.recv_buf_from(&mut buf) => {
@@ -114,9 +149,17 @@ async fn dispatch_server_msgs(
                     tracing::error!(?buf, "received invalid message");
                     continue;
                 };
-                handle_msg(src, msg, &mut pending_sessions, &mut sessions, &socket, bcast_addr, &task_sender).await?;
-                // TODO: grace period so we wait for all servers to ack
-                if sessions.is_empty() {
+                handle_msg(
+                    src,
+                    msg,
+                    &mut pending_sessions,
+                    &mut sessions,
+                    &socket,
+                    bcast_addr,
+                    &task_sender
+                ).await?;
+                // make sure we only quit after the grace period is over
+                if sessions.is_empty() && matches!(grace, Grace::Ended) {
                     tracing::info!("completed all sessions!");
                     break;
                 }

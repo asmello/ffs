@@ -9,7 +9,7 @@ use network::{
     server::serve,
     IpVersion,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(Debug, Parser)]
@@ -37,6 +37,9 @@ enum Command {
     Send {
         #[arg(short, long)]
         interactive: bool,
+        /// Time waited for servers to reply after first transfer starts.
+        #[arg(long, conflicts_with = "interactive", default_value_t = 1000)]
+        grace_period_ms: u64,
         // TODO: this could be optional in interactive mode
         path: PathBuf,
     },
@@ -54,6 +57,7 @@ fn init() {
     }
 }
 
+// TODO: turmoil tests
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     init();
@@ -77,11 +81,16 @@ async fn main() -> eyre::Result<()> {
             };
             serve(&name, ip_version, overwrite).await?;
         }
-        Command::Send { path, interactive } => {
+        Command::Send {
+            path,
+            interactive,
+            grace_period_ms,
+        } => {
             if interactive {
                 send_interactive(ip_version, &path).await;
             } else {
-                send_to_all(ip_version, &path).await?;
+                let grace_period = Duration::from_millis(grace_period_ms);
+                send_to_all(ip_version, &path, grace_period).await?;
             }
         }
     }

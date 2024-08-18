@@ -1,12 +1,11 @@
-use async_stream::stream;
 use std::{
     io,
     path::{Path, PathBuf},
 };
 use tokio::fs::ReadDir;
-use tokio_stream::Stream;
 
 // TODO: symbolic links?
+// TODO: quickcheck tests?
 pub struct FileGenerator {
     paths: Vec<PathBuf>,
     dir: Option<ReadDir>,
@@ -26,17 +25,6 @@ impl FileGenerator {
         Self {
             paths: vec![path.to_path_buf()],
             dir: Default::default(),
-        }
-    }
-
-    pub fn into_stream(mut self) -> impl Stream<Item = io::Result<PathBuf>> {
-        // if we were to implement the Stream trait directly, we'd need to
-        // handle polling ourselves, since it's not an async trait... this is
-        // much simpler
-        stream! {
-            while let Some(r) = self.next().await {
-                yield r;
-            }
         }
     }
 

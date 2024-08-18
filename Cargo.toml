@@ -8,7 +8,6 @@ edition = "2021"
 tokio-console = ["tokio/tracing"]
 
 [dependencies]
-async-stream = "0.3.5"
 bitcode = "0.6.3"
 clap = { version = "4.5.15", features = ["derive"] }
 console-subscriber = "0.4.0"
