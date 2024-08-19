@@ -1,7 +1,7 @@
 use super::{addresses, create_socket, IpVersion, SocketMode};
 use crate::{
     file_generator::FileGenerator,
-    protocol::{ClientMessage, Hash, Identifier, Nonce, ServerMessage},
+    protocol::{ClientMessage, Hash, Identifier, Nonce, ServerMessage, DATAGRAM_SIZE_LIMIT},
     tui::Tui,
 };
 use crossterm::event::{Event, KeyCode};
@@ -29,13 +29,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
-// assuming MTU of 1500 (typical for ethernet), this is 1500 - 40 (ipv6 header)
-// - 8 (udp header) = 1452. if we estimate this too high, most networks will
-// just fragment the packet, which is not the end of the world, but may increase
-// re-send rate (as even one fragment lost invalidates the entire datagram).
-const DATAGRAM_SIZE_LIMIT: usize = 1452;
-
-pub async fn send_to_all(
+pub async fn broadcast_from_path(
     ip_version: IpVersion,
     path: &Path,
     grace_period: Duration,
@@ -45,14 +39,14 @@ pub async fn send_to_all(
         let addr = addresses(ip_version);
         let socket = create_socket(addr.send, SocketMode::Send)?;
         let (task_tx, task_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(dispatch_server_msgs(
+        let handle = tokio::spawn(broadcast_all(
             socket,
             addr.recv,
             FileGenerator::new(path),
             task_tx,
             grace_period,
         ));
-        tasks.push((handle, "dispatch_server_msgs".into()));
+        tasks.push((handle, "broadcast_all".into()));
         task_rx
     };
 
@@ -86,7 +80,7 @@ pub async fn send_to_all(
 }
 
 #[derive(Debug, Default)]
-enum Grace {
+enum GraceStatus {
     #[default]
     Waiting,
     Started {
@@ -95,18 +89,18 @@ enum Grace {
     Ended,
 }
 
-impl Grace {
+impl GraceStatus {
     fn end(&self) -> Option<Instant> {
         match self {
-            Grace::Waiting => None,
-            Grace::Started { end_at } => Some(*end_at),
-            Grace::Ended => None,
+            GraceStatus::Waiting => None,
+            GraceStatus::Started { end_at } => Some(*end_at),
+            GraceStatus::Ended => None,
         }
     }
 }
 
 // NOTE: this task must be the exclusive reader of the socket
-async fn dispatch_server_msgs(
+async fn broadcast_all(
     socket: UdpSocket,
     bcast_addr: SocketAddr,
     paths: FileGenerator,
@@ -114,7 +108,7 @@ async fn dispatch_server_msgs(
     grace_period: Duration,
 ) -> eyre::Result<()> {
     let socket = Arc::new(socket);
-    let mut grace = Grace::default();
+    let mut grace = GraceStatus::default();
     let mut error_count = 0;
     let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
     let mut pending_sessions = HashMap::new();
@@ -124,10 +118,21 @@ async fn dispatch_server_msgs(
         buf.clear();
         let grace_end = grace.end();
         tokio::select! {
+            // if we go 5 seconds without any of the other futures completing,
+            // that's most likely a bug
+            _ = tokio::time::sleep(Duration::from_secs(5)),
+                if tracing::enabled!(Level::DEBUG) => {
+                tracing::debug!(
+                    pending_sessions = ?pending_sessions.keys().collect::<Vec<_>>(),
+                    active_sessions = ?sessions.keys().collect::<Vec<_>>(),
+                    "no progress in the last 5 seconds, we might be stuck"
+                );
+            }
             // track when the grace period expires
-            _ = async { tokio::time::sleep_until(grace_end.unwrap()).await }, if grace_end.is_some() => {
+            _ = async { tokio::time::sleep_until(grace_end.unwrap()).await },
+                if grace_end.is_some() => {
                 tracing::trace!("grace period ended");
-                grace = Grace::Ended;
+                grace = GraceStatus::Ended;
                 if sessions.is_empty() {
                     tracing::info!("completed all sessions");
                     break;
@@ -152,7 +157,7 @@ async fn dispatch_server_msgs(
                 // every new session we start renews the grace period
                 let end_at = Instant::now() + grace_period;
                 tracing::trace!(?end_at, "grace period renewed");
-                grace = Grace::Started { end_at  };
+                grace = GraceStatus::Started { end_at  };
                 pending_sessions.insert(nonce, (path, size));
             }
             r = socket.recv_buf_from(&mut buf) => {
@@ -171,7 +176,7 @@ async fn dispatch_server_msgs(
                     &task_sender
                 ).await?;
                 // make sure we only quit after the grace period is over
-                if sessions.is_empty() && matches!(grace, Grace::Ended) {
+                if sessions.is_empty() && matches!(grace, GraceStatus::Ended) {
                     tracing::info!("completed all sessions!");
                     break;
                 } else if sessions.is_empty() {

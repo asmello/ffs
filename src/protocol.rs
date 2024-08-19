@@ -11,6 +11,12 @@ use std::{
     io::{self, Write},
 };
 
+// assuming MTU of 1500 (typical for ethernet), this is 1500 - 40 (ipv6 header)
+// - 8 (udp header) = 1452. if we estimate this too high, most networks will
+// just fragment the packet, which is not the end of the world, but may increase
+// re-send rate (as even one fragment lost invalidates the entire datagram).
+pub const DATAGRAM_SIZE_LIMIT: usize = 1452;
+
 #[derive(Debug)]
 pub struct Hash<'data>(Cow<'data, [u8; 32]>);
 

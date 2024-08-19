@@ -5,7 +5,7 @@ mod tui;
 
 use clap::{Parser, Subcommand};
 use network::{
-    client::{send_interactive, send_to_all},
+    client::{broadcast_from_path, send_interactive},
     server::serve,
     IpVersion,
 };
@@ -90,7 +90,7 @@ async fn main() -> eyre::Result<()> {
                 send_interactive(ip_version, &path).await;
             } else {
                 let grace_period = Duration::from_millis(grace_period_ms);
-                send_to_all(ip_version, &path, grace_period).await?;
+                broadcast_from_path(ip_version, &path, grace_period).await?;
             }
         }
     }
