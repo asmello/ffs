@@ -15,6 +15,8 @@ use std::{
 // - 8 (udp header) = 1452. if we estimate this too high, most networks will
 // just fragment the packet, which is not the end of the world, but may increase
 // re-send rate (as even one fragment lost invalidates the entire datagram).
+// TODO: validate if fragmented packets are truly a problem in practice. for
+// large files processing small chunks adds a ton of overhead...
 pub const DATAGRAM_SIZE_LIMIT: usize = 1452;
 // this is the effective capacity we have in each data message after discounting
 // the metadata/header overhead (1 byte for the tag, 8 bytes for the id, 8 bytes

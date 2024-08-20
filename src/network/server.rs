@@ -58,8 +58,9 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
         request_repetitions_at: None,
     };
 
-    // NOTE: we could avoid a second read buffer if we used [`UdpSocket::readable`], but that'd
+    // we could avoid a second read buffer if we used [`UdpSocket::readable`], but that'd
     // require 2 syscalls per message so it's probably slower.
+    // TODO: benchmark to validate this assumption
     let mut mc_read_buf = Vec::with_capacity(65535);
     let mut uc_read_buf = Vec::with_capacity(65535);
     let mut write_buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
@@ -81,12 +82,15 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
         mc_read_buf.clear();
         uc_read_buf.clear();
         tokio::select! {
+            // catch-all for broadcast messages
             r = multicast_socket.recv_buf_from(&mut mc_read_buf) => {
                 decode_and_handle_msg!(r, mc_read_buf);
             }
+            // used to track replies to repetition requests and unicast transfers
             r = ctx.unicast_socket.recv_buf_from(&mut uc_read_buf) => {
                 decode_and_handle_msg!(r, uc_read_buf);
             }
+            // triggered once a gap is detected in any file
             _ = async { tokio::time::sleep_until(ctx.request_repetitions_at.unwrap()).await },
                 if ctx.request_repetitions_at.is_some() => {
                 request_repetitions(&mut ctx, &mut write_buf).await;
@@ -266,13 +270,10 @@ async fn handle_message(
                 return;
             }
 
-            // repeated messages can occur if we request a re-transmission but
-            // the original message (or a re-transmission) was not lost, but
-            // just delayed
-            if entry
-                .received
-                .contains_range(offset..=offset + (len - 1) as u64)
-            {
+            let bytes_range = offset..=offset + (len - 1) as u64;
+            // repeated messages can occur if we request a repetition but the
+            // original message (or a repetition) was not lost, but just delayed
+            if entry.received.contains_range(bytes_range.clone()) {
                 tracing::debug!(%id, offset, "redundant chunk, skipped");
                 return;
             }
@@ -314,11 +315,11 @@ async fn handle_message(
             entry
                 .received
                 // we checked len > 0 previously
-                .insert_range(offset..=offset + (len - 1) as u64);
+                .insert_range(bytes_range);
             if has_gaps(&entry.received) && ctx.request_repetitions_at.is_none() {
                 // we can reach here while processing a repeated message too, in which case we may
                 // have already requested a repetition for the remaining gaps as well. if we fill
-                // in the gaps before requesting another re-transmission, that's fine, we'll detect
+                // in the gaps before the next repetition request window, that's fine, we'll detect
                 // that in [`request_repetitions`] before we send any requests. note that we can
                 // still end up with duplicate data messages due to delays and reordering of the
                 // original messages or any repetition, so we need to handle that as well.
@@ -341,8 +342,8 @@ async fn handle_message(
                     tracing::info!(%id, len = entry.curr_size, hash = %entry.hash, "file transfer completed");
                 }
                 Ordering::Greater => {
-                    // this is technically redundant, but in release mode we may not run the checks
-                    // prior to this point
+                    // this is technically unreachable in debug mode, but in release mode we don't
+                    // run the checks prior to this point so it's good to have a fallback
                     tracing::error!(
                         recv = entry.curr_size,
                         expected = entry.expected_size,

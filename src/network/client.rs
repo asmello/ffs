@@ -377,7 +377,7 @@ async fn send_all_chunks(
         let sent = send_chunk(&mut file, &socket, &mut buf, id, offset, dst).await?;
         tracing::trace!("sent {sent} bytes");
         debug_assert!(
-            sent == CHUNK_SIZE || offset + CHUNK_SIZE > file_size,
+            sent == CHUNK_SIZE || (sent < CHUNK_SIZE && offset + CHUNK_SIZE > file_size),
             "unexpected chunk size {sent} at offset {offset} \
             (count={count}, total_size={file_size})"
         );
