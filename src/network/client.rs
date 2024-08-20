@@ -1,7 +1,9 @@
 use super::{addresses, create_socket, IpVersion, SocketMode};
 use crate::{
     file_generator::FileGenerator,
-    protocol::{ClientMessage, Hash, Identifier, Nonce, ServerMessage, DATAGRAM_SIZE_LIMIT},
+    protocol::{
+        ClientMessage, Hash, Identifier, Nonce, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT,
+    },
     tui::Tui,
 };
 use crossterm::event::{Event, KeyCode};
@@ -119,10 +121,9 @@ async fn broadcast_all(
         let grace_end = grace.end();
         tokio::select! {
             // if we go 5 seconds without any of the other futures completing,
-            // that's most likely a bug
-            _ = tokio::time::sleep(Duration::from_secs(5)),
-                if tracing::enabled!(Level::DEBUG) => {
-                tracing::debug!(
+            // either the network is very bad or we got a bug
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                tracing::warn!(
                     pending_sessions = ?pending_sessions.keys().collect::<Vec<_>>(),
                     active_sessions = ?sessions.keys().collect::<Vec<_>>(),
                     "no progress in the last 5 seconds, we might be stuck"
@@ -162,9 +163,12 @@ async fn broadcast_all(
             }
             r = socket.recv_buf_from(&mut buf) => {
                 let (_, src) = r?;
-                let Ok(msg) = ServerMessage::decode(&buf) else {
-                    tracing::error!(?buf, "received invalid message");
-                    continue;
+                let msg = match  ServerMessage::decode(&buf) {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        tracing::error!(?err, ?buf, "received invalid message");
+                        continue;
+                    }
                 };
                 handle_msg(
                     src,
@@ -355,7 +359,7 @@ async fn handle_msg(
 #[tracing::instrument(level = Level::DEBUG, skip(socket, id), fields(%id) err)]
 async fn send_all_chunks(
     path: Arc<PathBuf>,
-    size: u64,
+    file_size: u64,
     socket: Arc<UdpSocket>,
     id: Identifier,
     dst: SocketAddr,
@@ -366,26 +370,38 @@ async fn send_all_chunks(
     // total size = tag (1 byte) + id (8 bytes) + offset (8 bytes) + content
     let mut buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
 
+    let mut count = 0;
     let mut offset = 0;
     loop {
-        tracing::trace!(offset, "sending a chunk");
+        tracing::trace!(offset, "sending chunk");
         let sent = send_chunk(&mut file, &socket, &mut buf, id, offset, dst).await?;
         tracing::trace!("sent {sent} bytes");
+        debug_assert!(
+            sent == CHUNK_SIZE || offset + CHUNK_SIZE > file_size,
+            "unexpected chunk size {sent} at offset {offset} \
+            (count={count}, total_size={file_size})"
+        );
+        offset += sent; // <= 1452
+        count += 1;
         if sent == 0 {
-            tracing::warn!("no data sent this iteration, assuming all chunks have been sent");
+            tracing::warn!(
+                count,
+                offset,
+                "no data sent this iteration, assuming all chunks have been sent"
+            );
             break;
         }
-        offset += sent; // <= 1452
-        match offset.cmp(&size) {
+        match offset.cmp(&file_size) {
             Ordering::Less => (),
             Ordering::Equal => {
-                tracing::debug!("completed sending all chunks");
+                tracing::debug!(count, total_sent = offset, "completed sending all chunks");
                 break;
             }
             Ordering::Greater => {
                 tracing::warn!(
-                    offset,
-                    size,
+                    count,
+                    total_sent = offset,
+                    file_size,
                     "sent more data than expected, file might have been modified while being read"
                 );
                 // while we'd still detect the EOF by reaching sent == 0, the hash will certainly

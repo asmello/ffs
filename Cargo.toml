@@ -8,7 +8,6 @@ edition = "2021"
 tokio-console = ["tokio/tracing"]
 
 [dependencies]
-bytemuck = "1.17.0"
 byteorder = "1.5.0"
 clap = { version = "4.5.15", features = ["derive"] }
 console-subscriber = "0.4.0"
@@ -17,7 +16,9 @@ dashmap = "6.0.1"
 eyre = "0.6.12"
 hex = "0.4.3"
 hostname = "0.4.0"
+itertools = "0.13.0"
 rand = "0.8.5"
+range-set = "0.0.11"
 ratatui = "0.28.0"
 sha2 = "0.10.8"
 socket2 = "0.5.7"

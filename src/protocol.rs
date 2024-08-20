@@ -16,6 +16,10 @@ use std::{
 // just fragment the packet, which is not the end of the world, but may increase
 // re-send rate (as even one fragment lost invalidates the entire datagram).
 pub const DATAGRAM_SIZE_LIMIT: usize = 1452;
+// this is the effective capacity we have in each data message after discounting
+// the metadata/header overhead (1 byte for the tag, 8 bytes for the id, 8 bytes
+// for the offset), which we use as the chunk size.
+pub const CHUNK_SIZE: u64 = DATAGRAM_SIZE_LIMIT as u64 - (1 + 8 + 8);
 
 #[derive(Debug)]
 pub struct Hash<'data>(Cow<'data, [u8; 32]>);
@@ -131,7 +135,7 @@ pub enum ServerMessage<'data> {
     },
     Repeat {
         id: Identifier,
-        offsets: &'data [u64],
+        offsets: Cow<'data, [u64]>,
     },
     Done {
         id: Identifier,
@@ -139,7 +143,7 @@ pub enum ServerMessage<'data> {
 }
 
 impl<'data> ServerMessage<'data> {
-    pub fn encode(&self, mut buf: impl Write) -> io::Result<()> {
+    pub fn encode(&self, buf: &mut impl Write) -> io::Result<()> {
         match self {
             ServerMessage::Announce(name) => {
                 buf.write_u8(ANNOUNCE_TAG)?;
@@ -163,7 +167,7 @@ impl<'data> ServerMessage<'data> {
             ServerMessage::Repeat { id, offsets } => {
                 buf.write_u8(REPEAT_TAG)?;
                 buf.write_u64::<BigEndian>(id.0)?;
-                for offset in *offsets {
+                for offset in offsets.as_ref() {
                     buf.write_u64::<BigEndian>(*offset)?;
                 }
             }
@@ -176,9 +180,12 @@ impl<'data> ServerMessage<'data> {
     }
 
     pub fn decode(buf: &'data [u8]) -> eyre::Result<Self> {
+        let total_len = buf.len();
         let mut cursor = io::Cursor::new(buf);
         match cursor.read_u8().wrap_err("missing tag")? {
-            ANNOUNCE_TAG => Ok(Self::Announce(std::str::from_utf8(buf)?)),
+            ANNOUNCE_TAG => Ok(Self::Announce(std::str::from_utf8(remaining_slice(
+                cursor,
+            ))?)),
             ACK_TAG => {
                 let nonce = cursor
                     .read_u32::<BigEndian>()
@@ -211,9 +218,28 @@ impl<'data> ServerMessage<'data> {
                     .read_u64::<BigEndian>()
                     .wrap_err("incomplete repeat message, could not read id")?
                     .into();
-                let offsets = bytemuck::try_cast_slice(remaining_slice(cursor))
-                    .map_err(|err| eyre::eyre!(err))?;
-                Ok(Self::Repeat { id, offsets })
+                // total_len = 1 byte (tag) + 8 bytes (id) + offsets_len so
+                // offsets_len = total_len - 1 - 8 and since each offset is 8
+                // bytes, offsets_len / 8 gives us the offset_count
+                let offset_count = (total_len - 1 - 8) / 8;
+                let mut offsets = Vec::with_capacity(offset_count);
+                for _ in 0..offset_count {
+                    offsets.push(
+                        cursor
+                            .read_u64::<BigEndian>()
+                            .expect("count was derived from len"),
+                    );
+                }
+                // note we can't just use the original buffer directly because
+                // we need 8 bytes alignment, and the buffer is only 1 byte
+                // aligned
+                // TODO: can we make the message 8 bytes aligned? would require
+                // some padding but might be worth avoiding the extra allocation
+                // and copying
+                Ok(Self::Repeat {
+                    id,
+                    offsets: Cow::Owned(offsets),
+                })
             }
             DONE_TAG => {
                 let id = cursor
@@ -250,7 +276,7 @@ pub enum ClientMessage<'data> {
 }
 
 impl<'data> ClientMessage<'data> {
-    pub fn encode(&self, mut buf: impl Write) -> io::Result<()> {
+    pub fn encode(&self, buf: &mut impl Write) -> io::Result<()> {
         match self {
             ClientMessage::Discover => {
                 buf.write_u8(DISCOVER_TAG)?;
