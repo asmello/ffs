@@ -47,7 +47,7 @@ struct ServerContext<'name> {
     open_opts: OpenOptions,
 }
 
-pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::Result<()> {
+pub async fn receive(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::Result<()> {
     let addr = addresses(ip_version);
     let multicast_socket = create_socket(addr.recv, SocketMode::Receive)?;
     let local_addr = multicast_socket.local_addr().unwrap();

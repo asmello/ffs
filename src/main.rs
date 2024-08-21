@@ -6,7 +6,7 @@ mod tui;
 use clap::{Parser, Subcommand};
 use network::{
     client::{broadcast_from_path, send_interactive},
-    server::serve,
+    server::receive,
     IpVersion,
 };
 use std::{path::PathBuf, time::Duration};
@@ -27,13 +27,15 @@ struct Args {
 
 #[derive(Debug, Clone, Subcommand)]
 enum Command {
-    Serve {
+    #[command(visible_aliases = ["recv", "r"])]
+    Receive {
         /// Whether to allow overwriting existing files.
         #[arg(long)]
         overwrite: bool,
         /// Name of this server for advertisement.
         name: Option<String>,
     },
+    #[command(visible_alias = "s")]
     Send {
         #[arg(short, long)]
         interactive: bool,
@@ -72,14 +74,14 @@ async fn main() -> eyre::Result<()> {
     };
 
     match args.cmd {
-        Command::Serve { name, overwrite } => {
+        Command::Receive { name, overwrite } => {
             let name = if let Some(name) = name {
                 name
             } else {
                 let hostname = hostname::get()?;
                 hostname.to_string_lossy().into_owned()
             };
-            serve(&name, ip_version, overwrite).await?;
+            receive(&name, ip_version, overwrite).await?;
         }
         Command::Send {
             path,
