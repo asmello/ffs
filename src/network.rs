@@ -1,9 +1,16 @@
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
-use tokio::net::UdpSocket;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt},
+    net::UdpSocket,
+};
+
+use crate::protocol::Hash;
 
 pub mod client;
 pub mod server;
@@ -66,6 +73,28 @@ fn addresses(ip_version: IpVersion) -> Addresses {
             recv: SocketAddr::new(IPV6_MULTICAST_ADDR.into(), LISTEN_PORT),
         },
     }
+}
+
+// set to tokio's default `max_buf_size`
+const HASHING_CHUNK_SIZE: usize = 2 * 1024 * 1024;
+
+// TODO: feels like async is not a great fit here
+async fn hash(mut file: File, size: usize, mut buf: &mut Vec<u8>) -> io::Result<Hash<'static>> {
+    file.rewind().await?;
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0;
+    while bytes_read < size {
+        buf.clear();
+        let n = file.read_buf(&mut buf).await?;
+        hasher.update(&*buf);
+        bytes_read += n;
+    }
+    file.rewind().await?;
+    Ok(hasher
+        .finalize()
+        .to_vec()
+        .try_into()
+        .expect("sha256 has 32 bytes exactly"))
 }
 
 #[cfg(test)]

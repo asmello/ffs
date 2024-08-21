@@ -1,13 +1,14 @@
 use super::{addresses, create_socket, IpVersion, SocketMode};
-use crate::protocol::{
-    ClientMessage, Hash, Identifier, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT,
+use crate::{
+    network::HASHING_CHUNK_SIZE,
+    protocol::{ClientMessage, Hash, Identifier, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT},
 };
 use itertools::Itertools;
 use rand::Rng;
 use range_set::RangeSet;
 use std::{
-    cmp::Ordering, collections::HashMap, io, net::SocketAddr, ops::RangeInclusive, path::Path,
-    time::Duration,
+    borrow::Cow, cmp::Ordering, collections::HashMap, io, net::SocketAddr, ops::RangeInclusive,
+    path::Path, time::Duration,
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -17,7 +18,12 @@ use tokio::{
 };
 use tracing::Level;
 
-const REPEAT_REQUEST_DELAY: Duration = Duration::from_millis(100);
+const REPEAT_REQUEST_DELAY: Duration = Duration::from_millis(200);
+// message_len = 1 byte (tag) + 8 bytes (id) + offsets_len and since the
+// max message_len is `DATAGRAM_SIZE_LIMIT`, the maximum offsets_len is
+// `DATAGRAM_SIZE_LIMIT - 1 - 8`. since each offset uses up 8 bytes, we
+// divide by 8 to get the maximum count that fits in a single datagram.
+const MAX_OFFSETS: usize = (DATAGRAM_SIZE_LIMIT - 1 - 8) / 8;
 
 // TODO: use a better tailored (and better maintained) implementation
 type RangeSetU64 = RangeSet<[RangeInclusive<u64>; 1]>;
@@ -26,9 +32,12 @@ struct FileEntry {
     src: SocketAddr,
     file: File,
     hash: Hash<'static>,
-    curr_size: usize,
-    expected_size: usize,
+    curr_size: u64,
+    expected_size: u64,
+    // holds all the byte positions that have been received
+    // (not just chunk boundaries, but *all* bytes in the file!)
     received: RangeSetU64,
+    last_received_at: Instant,
 }
 
 struct ServerContext<'name> {
@@ -36,7 +45,6 @@ struct ServerContext<'name> {
     unicast_socket: UdpSocket,
     sessions: HashMap<Identifier, FileEntry>,
     open_opts: OpenOptions,
-    request_repetitions_at: Option<Instant>,
 }
 
 pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::Result<()> {
@@ -44,7 +52,7 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
     let multicast_socket = create_socket(addr.recv, SocketMode::Receive)?;
     let local_addr = multicast_socket.local_addr().unwrap();
     let mut open_opts = tokio::fs::OpenOptions::new();
-    open_opts.write(true).read(false);
+    open_opts.write(true).read(true);
     if overwrite {
         open_opts.create(true).truncate(true);
     } else {
@@ -55,17 +63,32 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
         unicast_socket: create_socket(addr.send, SocketMode::Send)?,
         sessions: HashMap::new(),
         open_opts,
-        request_repetitions_at: None,
     };
 
-    // we could avoid a second read buffer if we used [`UdpSocket::readable`], but that'd
-    // require 2 syscalls per message so it's probably slower.
+    // we allocate buffers as large as needed to fit any datagram, because
+    // unfortunately if we don't have enough capacity the `recv` call will
+    // silently discard data... we could avoid a second read buffer if we used
+    // [`UdpSocket::readable`], but that'd require 2 syscalls per message so
+    // it's probably slower.
     // TODO: benchmark to validate this assumption
     let mut mc_read_buf = Vec::with_capacity(65535);
     let mut uc_read_buf = Vec::with_capacity(65535);
-    let mut write_buf = Vec::with_capacity(DATAGRAM_SIZE_LIMIT);
+    // ok, so this buffer serves two roles:
+    // 1. it's used to hold message payloads, which is bounded by
+    //    `DATAGRAM_SIZE_LIMIT`.
+    // 2. it's used to hold chunks of the file for hashing, which
+    //    is bounded by `HASHING_CHUNK_SIZE`.
+    // since `HASHING_CHUNK_SIZE` is larger, we allocate that much capacity.
+    // note that the client has to control the size of its write buffer
+    // more carefully in order to manage chunking, but we have no such
+    // requirements here. it's still a good idea to keep messages under
+    // `DATAGRAM_SIZE_LIMIT`, though, to avoid fragmentation. this is
+    // particularly desirable for REPEAT messages.
+    let mut write_buf = Vec::with_capacity(HASHING_CHUNK_SIZE);
+    let mut offsets_buf = Vec::with_capacity(MAX_OFFSETS);
 
-    tracing::info!("listening on {local_addr:?}");
+    // this may seem like a ton of buffers, but they get reused for the lifetime
+    // of the server, so it's not that bad
 
     macro_rules! decode_and_handle_msg {
         ($ret:ident, $buf:ident) => {
@@ -77,6 +100,8 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
             handle_message(&mut ctx, addr, msg, &mut write_buf).await;
         };
     }
+
+    tracing::info!("listening on {local_addr:?}");
 
     loop {
         mc_read_buf.clear();
@@ -90,11 +115,9 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
             r = ctx.unicast_socket.recv_buf_from(&mut uc_read_buf) => {
                 decode_and_handle_msg!(r, uc_read_buf);
             }
-            // triggered once a gap is detected in any file
-            _ = async { tokio::time::sleep_until(ctx.request_repetitions_at.unwrap()).await },
-                if ctx.request_repetitions_at.is_some() => {
-                request_repetitions(&mut ctx, &mut write_buf).await;
-                ctx.request_repetitions_at = None;
+            // if we stop receiving data for a short while, request repetitions
+            _ = tokio::time::sleep(REPEAT_REQUEST_DELAY), if !ctx.sessions.is_empty() => {
+                request_repetitions(&mut ctx, &mut write_buf, &mut offsets_buf).await;
             }
             // if we have active sessions but go 5 seconds without receiving any
             // messages, odds are we got a problem
@@ -108,35 +131,51 @@ pub async fn serve(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::
     }
 }
 
-async fn request_repetitions(ctx: &mut ServerContext<'_>, buf: &mut Vec<u8>) {
+async fn request_repetitions(
+    ctx: &mut ServerContext<'_>,
+    buf: &mut Vec<u8>,
+    offsets: &mut Vec<u64>,
+) {
+    let add_until = |offsets: &mut Vec<u64>, start, limit| {
+        let mut offset = start;
+        while offsets.len() < MAX_OFFSETS {
+            offsets.push(offset);
+            if offset + CHUNK_SIZE < limit {
+                offset += CHUNK_SIZE;
+            } else {
+                break;
+            }
+        }
+    };
+
     for (&id, entry) in &ctx.sessions {
-        if !has_gaps(&entry.received) {
+        if entry.last_received_at.elapsed() < REPEAT_REQUEST_DELAY {
             continue;
         }
 
-        tracing::trace!(%id, bytes = ?entry.received, "bytes received so far");
+        tracing::trace!(%id, bytes = ?entry.received, file_size = entry.expected_size, "bytes received so far");
 
-        let ranges = entry.received.as_ref();
-        // TODO: is it worth making this a permanent buffer?
-        let mut offsets = Vec::with_capacity(ranges.len());
-        for (a, b) in ranges.iter().tuple_windows() {
-            let mut offset = *a.end() + 1;
-            loop {
-                offsets.push(offset);
-                if offset + CHUNK_SIZE < *b.start() {
-                    offset += CHUNK_SIZE;
-                } else {
-                    debug_assert_eq!(offset + CHUNK_SIZE, *b.start());
-                    break;
-                }
+        offsets.clear();
+        if let Some(min) = entry.received.min() {
+            if min > 0 {
+                add_until(offsets, 0, min);
             }
         }
-        // TODO: handle missing first or last chunks
+        for (a, b) in entry.received.as_ref().iter().tuple_windows() {
+            add_until(offsets, *a.end() + 1, *b.start());
+        }
+        if let Some(max) = entry.received.max() {
+            let last_byte = entry.expected_size - 1;
+            if max < last_byte {
+                add_until(offsets, max + 1, last_byte);
+            }
+        }
+
         tracing::debug!(%id, ?offsets, "requesting repetitions");
         try_send(
             ServerMessage::Repeat {
                 id,
-                offsets: offsets.into(),
+                offsets: Cow::Borrowed(offsets),
             },
             &ctx.unicast_socket,
             entry.src,
@@ -144,10 +183,6 @@ async fn request_repetitions(ctx: &mut ServerContext<'_>, buf: &mut Vec<u8>) {
         )
         .await;
     }
-}
-
-fn has_gaps(set: &RangeSetU64) -> bool {
-    set.as_ref().len() > 1
 }
 
 async fn try_send(
@@ -237,8 +272,9 @@ async fn handle_message(
                     file,
                     hash: hash.into_owned(),
                     curr_size: 0,
-                    expected_size: size as usize,
+                    expected_size: size,
                     received: RangeSet::new(),
+                    last_received_at: Instant::now(),
                 },
             );
         }
@@ -258,9 +294,12 @@ async fn handle_message(
             // allowed only for last chunk
             let chunk_smaller_than_expected = len < CHUNK_SIZE as usize;
 
-            let is_last_chunk = (offset + CHUNK_SIZE) as usize >= entry.expected_size;
+            let is_last_chunk = offset + CHUNK_SIZE >= entry.expected_size;
 
-            if chunk_larger_than_expected || (chunk_smaller_than_expected && !is_last_chunk) {
+            if len == 0
+                || chunk_larger_than_expected
+                || (chunk_smaller_than_expected && !is_last_chunk)
+            {
                 tracing::error!(%id, offset, len, "chunk has unexpected length");
                 ctx.sessions.remove(&id);
                 reply_or_abort!(ServerMessage::Error {
@@ -277,7 +316,7 @@ async fn handle_message(
                 tracing::debug!(%id, offset, "redundant chunk, skipped");
                 return;
             }
-            let new_size = entry.curr_size + len;
+            let new_size = entry.curr_size + len as u64;
             debug_assert!(
                 entry.expected_size >= new_size,
                 "session {id}, at offset {offset}, \
@@ -316,30 +355,41 @@ async fn handle_message(
                 .received
                 // we checked len > 0 previously
                 .insert_range(bytes_range);
-            if has_gaps(&entry.received) && ctx.request_repetitions_at.is_none() {
-                // we can reach here while processing a repeated message too, in which case we may
-                // have already requested a repetition for the remaining gaps as well. if we fill
-                // in the gaps before the next repetition request window, that's fine, we'll detect
-                // that in [`request_repetitions`] before we send any requests. note that we can
-                // still end up with duplicate data messages due to delays and reordering of the
-                // original messages or any repetition, so we need to handle that as well.
-                tracing::debug!(
-                    "gaps detected; scheduling repetition requests after {REPEAT_REQUEST_DELAY:?}"
-                );
-                ctx.request_repetitions_at = Some(Instant::now() + REPEAT_REQUEST_DELAY);
-            }
+            entry.last_received_at = Instant::now();
             match entry.curr_size.cmp(&entry.expected_size) {
                 Ordering::Less => {
                     tracing::trace!("remaining bytes: {}", entry.expected_size - entry.curr_size);
                 }
                 Ordering::Equal => {
-                    // TODO: check hash
                     let entry = ctx
                         .sessions
                         .remove(&id)
                         .expect("we hold a &mut so the entry must still be there");
+                    match super::hash(entry.file, entry.curr_size as usize, buf).await {
+                        Ok(hash) => {
+                            if hash != entry.hash {
+                                tracing::error!(computed = %hash, expected = %entry.hash, "hash mismatch!");
+                                reply_or_abort!(ServerMessage::Error {
+                                    id,
+                                    msg: &format!(
+                                        "mismatched hash! got {hash}, expected {}",
+                                        entry.hash
+                                    )
+                                });
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "could not calculate hash, aborting session");
+                            reply_or_abort!(ServerMessage::Error {
+                                id,
+                                msg: &format!("error calculating hash: {err}")
+                            });
+                            return;
+                        }
+                    };
                     reply_or_abort!(ServerMessage::Done { id });
-                    tracing::info!(%id, len = entry.curr_size, hash = %entry.hash, "file transfer completed");
+                    tracing::info!(%id, len = entry.curr_size, hash = %entry.hash, "file transfer completed successfully");
                 }
                 Ordering::Greater => {
                     // this is technically unreachable in debug mode, but in release mode we don't

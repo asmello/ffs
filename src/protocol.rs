@@ -23,7 +23,7 @@ pub const DATAGRAM_SIZE_LIMIT: usize = 1452;
 // for the offset), which we use as the chunk size.
 pub const CHUNK_SIZE: u64 = DATAGRAM_SIZE_LIMIT as u64 - (1 + 8 + 8);
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Hash<'data>(Cow<'data, [u8; 32]>);
 
 impl Hash<'_> {

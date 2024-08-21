@@ -1,15 +1,12 @@
-use super::{addresses, create_socket, IpVersion, SocketMode};
+use super::{addresses, create_socket, IpVersion, SocketMode, HASHING_CHUNK_SIZE};
 use crate::{
     file_generator::FileGenerator,
-    protocol::{
-        ClientMessage, Hash, Identifier, Nonce, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT,
-    },
+    protocol::{ClientMessage, Identifier, Nonce, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT},
     tui::Tui,
 };
 use crossterm::event::{Event, KeyCode};
 use rand::Rng;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -21,7 +18,7 @@ use std::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::AsyncSeekExt,
     net::UdpSocket,
     sync::mpsc,
     task::{JoinHandle, JoinSet},
@@ -205,37 +202,15 @@ async fn start_session(
     let nonce = rand::thread_rng().gen();
     let mut buf;
 
-    let mut file = tokio::fs::File::open(&path).await?;
+    let file = tokio::fs::File::open(&path).await?;
     let size = {
         let meta = file.metadata().await?;
         meta.len()
     };
 
-    // set to tokio's default `max_buf_size`
-    const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
-    buf = Vec::with_capacity(size.min(CHUNK_SIZE) as usize);
+    buf = Vec::with_capacity(HASHING_CHUNK_SIZE.min(size as usize));
 
-    let hash: Hash = {
-        // scan the file once to compute its hash
-        // TODO: is there a better way?
-        let mut hasher = Sha256::new();
-        let mut bytes_read = 0;
-        loop {
-            let n = file.read_buf(&mut buf).await?;
-            hasher.update(&buf);
-            bytes_read += n;
-            if bytes_read >= size as usize {
-                break;
-            }
-            buf.clear();
-        }
-        file.rewind().await?;
-        hasher
-            .finalize()
-            .to_vec()
-            .try_into()
-            .expect("sha256 has 32 bytes exactly")
-    };
+    let hash = super::hash(file, size as usize, &mut buf).await?;
 
     // send start message
     let path = path
