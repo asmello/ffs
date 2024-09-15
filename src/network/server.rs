@@ -18,7 +18,7 @@ use tokio::{
 };
 use tracing::Level;
 
-const REPEAT_REQUEST_DELAY: Duration = Duration::from_millis(200);
+const REPEAT_REQUEST_DELAY: Duration = Duration::from_millis(500);
 // message_len = 1 byte (tag) + 8 bytes (id) + offsets_len and since the
 // max message_len is `DATAGRAM_SIZE_LIMIT`, the maximum offsets_len is
 // `DATAGRAM_SIZE_LIMIT - 1 - 8`. since each offset uses up 8 bytes, we
@@ -118,14 +118,6 @@ pub async fn receive(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre
             // if we stop receiving data for a short while, request repetitions
             _ = tokio::time::sleep(REPEAT_REQUEST_DELAY), if !ctx.sessions.is_empty() => {
                 request_repetitions(&mut ctx, &mut write_buf, &mut offsets_buf).await;
-            }
-            // if we have active sessions but go 5 seconds without receiving any
-            // messages, odds are we got a problem
-            _ = tokio::time::sleep(Duration::from_secs(5)), if !ctx.sessions.is_empty() => {
-                tracing::warn!(
-                    ids = ?ctx.sessions.keys().collect::<Vec<_>>(),
-                    "no progress in the last 5 seconds, we might be stuck"
-                );
             }
         }
     }
