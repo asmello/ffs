@@ -17,6 +17,9 @@ use std::{
 // re-send rate (as even one fragment lost invalidates the entire datagram).
 // TODO: validate if fragmented packets are truly a problem in practice. for
 // large files processing small chunks adds a ton of overhead...
+// TODO: use Path MTU Discovery to dynamically adjust the MTU size. will need
+// to modify protocol for variable chunk size. possibly as a prelude stage.
+// https://en.wikipedia.org/wiki/Path_MTU_Discovery
 pub const DATAGRAM_SIZE_LIMIT: usize = 1452;
 // this is the effective capacity we have in each data message after discounting
 // the metadata/header overhead (1 byte for the tag, 8 bytes for the id, 8 bytes
