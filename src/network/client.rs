@@ -1,6 +1,7 @@
-use super::{addresses, create_socket, IpVersion, SocketMode, HASHING_CHUNK_SIZE};
+use super::UnicastInterface;
 use crate::{
     file_generator::FileGenerator,
+    network::HASHING_CHUNK_SIZE,
     protocol::{ClientMessage, Identifier, Nonce, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT},
     tui::Tui,
 };
@@ -29,18 +30,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
 pub async fn broadcast_from_path(
-    ip_version: IpVersion,
+    unicast_addr: SocketAddr,
     path: &Path,
     grace_period: Duration,
 ) -> eyre::Result<()> {
     let mut tasks = Vec::new();
     let mut task_rx = {
-        let addr = addresses(ip_version);
-        let socket = create_socket(addr.send, SocketMode::Send)?;
+        let UnicastInterface { socket, mcast_addr } = super::setup_unicast(unicast_addr)?;
         let (task_tx, task_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(broadcast_all(
             socket,
-            addr.recv,
+            mcast_addr,
             FileGenerator::new(path),
             task_tx,
             grace_period,
@@ -101,7 +101,7 @@ impl GraceStatus {
 // NOTE: this task must be the exclusive reader of the socket
 async fn broadcast_all(
     socket: UdpSocket,
-    bcast_addr: SocketAddr,
+    mcast_addr: SocketAddr,
     paths: FileGenerator,
     task_sender: mpsc::UnboundedSender<(JoinHandle<eyre::Result<()>>, String)>,
     grace_period: Duration,
@@ -151,7 +151,7 @@ async fn broadcast_all(
                         continue;
                     }
                 };
-                let (nonce, size) = start_session(&path, &socket, bcast_addr).await?;
+                let (nonce, size) = start_session(&path, &socket, mcast_addr).await?;
                 // every new session we start renews the grace period
                 let end_at = Instant::now() + grace_period;
                 tracing::trace!(?end_at, "grace period renewed");
@@ -173,7 +173,7 @@ async fn broadcast_all(
                     &mut pending_sessions,
                     &mut sessions,
                     &socket,
-                    bcast_addr,
+                    mcast_addr,
                     &task_sender
                 ).await?;
                 // make sure we only quit after the grace period is over
@@ -454,12 +454,12 @@ async fn send_chunk(
     Ok(read as u64)
 }
 
-pub async fn send_interactive(ip_version: IpVersion, _path: &Path) {
+pub async fn send_interactive(unicast_addr: SocketAddr, _path: &Path) {
     let cancel = CancellationToken::new();
 
     let mut tasks = JoinSet::new();
     tasks.spawn(tui_loop(cancel.clone()));
-    tasks.spawn(network_loop(ip_version, cancel.clone()));
+    tasks.spawn(network_loop(unicast_addr, cancel.clone()));
 
     while let Some(r) = tasks.join_next().await {
         if !cancel.is_cancelled() {
@@ -482,15 +482,14 @@ pub async fn send_interactive(ip_version: IpVersion, _path: &Path) {
     }
 }
 
-async fn network_loop(ip_version: IpVersion, cancel: CancellationToken) -> eyre::Result<()> {
-    let addr = addresses(ip_version);
-    let socket = create_socket(addr.send, SocketMode::Send)?;
+async fn network_loop(unicast_addr: SocketAddr, cancel: CancellationToken) -> eyre::Result<()> {
+    let UnicastInterface { socket, mcast_addr } = super::setup_unicast(unicast_addr)?;
     let mut buf = Vec::with_capacity(65536);
 
     ClientMessage::Discover
         .encode(&mut buf)
         .expect("vec grows as needed");
-    socket.send_to(&buf, addr.recv).await?;
+    socket.send_to(&buf, mcast_addr).await?;
 
     loop {
         tokio::select! {

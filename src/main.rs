@@ -7,9 +7,12 @@ use clap::{Parser, Subcommand};
 use network::{
     client::{broadcast_from_path, send_interactive},
     server::receive,
-    IpVersion,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(Debug, Parser)]
@@ -68,9 +71,8 @@ async fn main() -> eyre::Result<()> {
 
     let ip_version = match (args.use_ipv4, args.use_ipv6) {
         (true, true) => unreachable!("clap should enforce ip version choice is mutually exclusive"),
-        (true, false) => IpVersion::V4,
-        (false, true) => IpVersion::V6,
-        (false, false) => IpVersion::V6, // default if neither is set explicitly
+        (true, false) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+        (false, true) | (false, false) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
     };
 
     match args.cmd {

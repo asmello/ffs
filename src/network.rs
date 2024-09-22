@@ -17,62 +17,70 @@ pub mod server;
 
 const IPV6_MULTICAST_ADDR: Ipv6Addr = Ipv6Addr::new(0xff08, 0, 0, 0, 0, 0, 0xda, 0xda);
 const IPV4_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 242);
-const LISTEN_PORT: u16 = 43549;
+const MULTICAST_LISTEN_PORT: u16 = 43549;
 
-pub enum IpVersion {
-    V4,
-    V6,
+struct UnicastInterface {
+    socket: UdpSocket,
+    mcast_addr: SocketAddr,
 }
 
-enum SocketMode {
-    Send,
-    Receive,
-}
-
-fn create_socket(addr: SocketAddr, mode: SocketMode) -> io::Result<UdpSocket> {
-    let domain = if addr.is_ipv4() {
+fn domain_of(addr: SocketAddr) -> Domain {
+    if addr.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
-    };
+    }
+}
 
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_nonblocking(true)?;
+fn setup_unicast(addr: SocketAddr) -> io::Result<UnicastInterface> {
+    let unicast = Socket::new(domain_of(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    unicast.set_nonblocking(true)?;
+    unicast.bind(&SockAddr::from(addr))?;
+    Ok(UnicastInterface {
+        socket: UdpSocket::from_std(unicast.into())?,
+        mcast_addr: match addr.ip() {
+            IpAddr::V4(_) => SocketAddr::new(IPV4_MULTICAST_ADDR.into(), MULTICAST_LISTEN_PORT),
+            IpAddr::V6(_) => SocketAddr::new(IPV6_MULTICAST_ADDR.into(), MULTICAST_LISTEN_PORT),
+        },
+    })
+}
 
-    if matches!(mode, SocketMode::Receive) {
-        match addr.ip() {
-            IpAddr::V4(mc_addr) => {
-                socket.join_multicast_v4(&mc_addr, &Ipv4Addr::UNSPECIFIED)?;
+struct MulticastInterface {
+    mcast_sock: UdpSocket,
+    ucast_sock: UdpSocket,
+}
+
+fn setup_multicast(unicast_addr: SocketAddr) -> io::Result<MulticastInterface> {
+    let UnicastInterface {
+        socket: unicast, ..
+    } = setup_unicast(unicast_addr)?;
+
+    let multicast = {
+        let multicast = Socket::new(domain_of(unicast_addr), Type::DGRAM, Some(Protocol::UDP))?;
+        multicast.set_nonblocking(true)?;
+        match unicast_addr.ip() {
+            IpAddr::V4(addr) => {
+                multicast.join_multicast_v4(&IPV4_MULTICAST_ADDR, &addr)?;
             }
-            IpAddr::V6(mc_addr) => {
+            IpAddr::V6(_) => {
                 // TODO: may be necessary to set interface explicitly in MacOS
-                socket.join_multicast_v6(&mc_addr, 0)?;
-                socket.set_only_v6(true)?;
+                multicast.join_multicast_v6(&IPV6_MULTICAST_ADDR, 0)?;
+                multicast.set_only_v6(true)?;
             }
         }
-    }
+        // may seem strange to bind to the *unicast* ip here, but all this
+        // influences is which interface the socket is bound to, really. we wish
+        // to use the same interface we use for unicast communication, so we derive
+        // the interface from the unicast ip. the port is derived from the multicast
+        // group, though.
+        multicast.bind(&SocketAddr::new(unicast_addr.ip(), MULTICAST_LISTEN_PORT).into())?;
+        UdpSocket::from_std(multicast.into())?
+    };
 
-    socket.bind(&SockAddr::from(addr))?;
-
-    UdpSocket::from_std(socket.into())
-}
-
-struct Addresses {
-    send: SocketAddr,
-    recv: SocketAddr,
-}
-
-fn addresses(ip_version: IpVersion) -> Addresses {
-    match ip_version {
-        IpVersion::V4 => Addresses {
-            send: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-            recv: SocketAddr::new(IPV4_MULTICAST_ADDR.into(), LISTEN_PORT),
-        },
-        IpVersion::V6 => Addresses {
-            send: SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-            recv: SocketAddr::new(IPV6_MULTICAST_ADDR.into(), LISTEN_PORT),
-        },
-    }
+    Ok(MulticastInterface {
+        ucast_sock: unicast,
+        mcast_sock: multicast,
+    })
 }
 
 // set to tokio's default `max_buf_size`

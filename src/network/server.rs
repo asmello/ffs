@@ -1,6 +1,5 @@
-use super::{addresses, create_socket, IpVersion, SocketMode};
 use crate::{
-    network::HASHING_CHUNK_SIZE,
+    network::{MulticastInterface, HASHING_CHUNK_SIZE},
     protocol::{ClientMessage, Hash, Identifier, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT},
 };
 use itertools::Itertools;
@@ -42,15 +41,16 @@ struct FileEntry {
 
 struct ServerContext<'name> {
     name: &'name str,
-    unicast_socket: UdpSocket,
+    ucast_sock: UdpSocket,
     sessions: HashMap<Identifier, FileEntry>,
     open_opts: OpenOptions,
 }
 
-pub async fn receive(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre::Result<()> {
-    let addr = addresses(ip_version);
-    let multicast_socket = create_socket(addr.recv, SocketMode::Receive)?;
-    let local_addr = multicast_socket.local_addr().unwrap();
+pub async fn receive(name: &str, unicast_addr: SocketAddr, overwrite: bool) -> eyre::Result<()> {
+    let MulticastInterface {
+        mcast_sock,
+        ucast_sock,
+    } = super::setup_multicast(unicast_addr)?;
     let mut open_opts = tokio::fs::OpenOptions::new();
     open_opts.write(true).read(true);
     if overwrite {
@@ -60,7 +60,7 @@ pub async fn receive(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre
     }
     let mut ctx = ServerContext {
         name,
-        unicast_socket: create_socket(addr.send, SocketMode::Send)?,
+        ucast_sock,
         sessions: HashMap::new(),
         open_opts,
     };
@@ -101,18 +101,18 @@ pub async fn receive(name: &str, ip_version: IpVersion, overwrite: bool) -> eyre
         };
     }
 
-    tracing::info!("listening on {local_addr:?}");
+    tracing::info!("listening on {:?}", mcast_sock.local_addr().unwrap());
 
     loop {
         mc_read_buf.clear();
         uc_read_buf.clear();
         tokio::select! {
             // catch-all for broadcast messages
-            r = multicast_socket.recv_buf_from(&mut mc_read_buf) => {
+            r = mcast_sock.recv_buf_from(&mut mc_read_buf) => {
                 decode_and_handle_msg!(r, mc_read_buf);
             }
             // used to track replies to repetition requests and unicast transfers
-            r = ctx.unicast_socket.recv_buf_from(&mut uc_read_buf) => {
+            r = ctx.ucast_sock.recv_buf_from(&mut uc_read_buf) => {
                 decode_and_handle_msg!(r, uc_read_buf);
             }
             // if we stop receiving data for a short while, request repetitions
@@ -148,19 +148,21 @@ async fn request_repetitions(
         tracing::trace!(%id, bytes = ?entry.received, file_size = entry.expected_size, "bytes received so far");
 
         offsets.clear();
-        if let Some(min) = entry.received.min() {
+        let last_byte = entry.expected_size - 1;
+        if let (Some(min), Some(max)) = (entry.received.min(), entry.received.max()) {
             if min > 0 {
                 add_until(offsets, 0, min);
             }
-        }
-        for (a, b) in entry.received.as_ref().iter().tuple_windows() {
-            add_until(offsets, *a.end() + 1, *b.start());
-        }
-        if let Some(max) = entry.received.max() {
-            let last_byte = entry.expected_size - 1;
+            for (a, b) in entry.received.as_ref().iter().tuple_windows() {
+                add_until(offsets, *a.end() + 1, *b.start());
+            }
             if max < last_byte {
                 add_until(offsets, max + 1, last_byte);
             }
+        } else {
+            // edge case where no chunks have been received
+            // (most likely for small files)
+            add_until(offsets, 0, last_byte);
         }
 
         tracing::debug!(%id, ?offsets, "requesting repetitions");
@@ -169,7 +171,7 @@ async fn request_repetitions(
                 id,
                 offsets: Cow::Borrowed(offsets),
             },
-            &ctx.unicast_socket,
+            &ctx.ucast_sock,
             entry.src,
             buf,
         )
@@ -202,7 +204,7 @@ async fn handle_message(
 ) {
     macro_rules! reply_or_abort {
         ($msg:expr) => {
-            if !try_send($msg, &ctx.unicast_socket, src, buf).await {
+            if !try_send($msg, &ctx.ucast_sock, src, buf).await {
                 return;
             }
         };
