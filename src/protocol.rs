@@ -63,53 +63,25 @@ impl<'data> TryFrom<&'data [u8]> for Hash<'data> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct Identifier(u64);
-
-impl fmt::Debug for Identifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Id({:08x})", self.0)
-    }
-}
-
-impl From<u64> for Identifier {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl fmt::Display for Identifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:08x}", self.0)
-    }
-}
-
-impl Distribution<Identifier> for Standard {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Identifier {
-        Identifier(rng.gen())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct Nonce(u32);
+pub struct SessionId(u32);
 
-impl From<u32> for Nonce {
+impl From<u32> for SessionId {
     fn from(value: u32) -> Self {
         Self(value)
     }
 }
 
-impl fmt::Display for Nonce {
+impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:04x}", self.0)
     }
 }
 
-impl Distribution<Nonce> for Standard {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Nonce {
-        Nonce(rng.gen())
+impl Distribution<SessionId> for Standard {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> SessionId {
+        SessionId(rng.gen())
     }
 }
 
@@ -127,23 +99,22 @@ const DONE_TAG: u8 = 0x06;
 pub enum ServerMessage<'data> {
     Announce(&'data str),
     Ack {
-        nonce: Nonce,
-        id: Identifier,
+        session_id: SessionId,
     },
     Nack {
-        nonce: Nonce,
+        session_id: SessionId,
         msg: &'data str,
     },
     Error {
-        id: Identifier,
+        session_id: SessionId,
         msg: &'data str,
     },
     Repeat {
-        id: Identifier,
+        session_id: SessionId,
         offsets: Cow<'data, [u64]>,
     },
     Done {
-        id: Identifier,
+        session_id: SessionId,
     },
 }
 
@@ -154,31 +125,33 @@ impl<'data> ServerMessage<'data> {
                 buf.write_u8(ANNOUNCE_TAG)?;
                 buf.write_all(name.as_bytes())?;
             }
-            ServerMessage::Ack { nonce, id } => {
+            ServerMessage::Ack { session_id } => {
                 buf.write_u8(ACK_TAG)?;
-                buf.write_u32::<BigEndian>(nonce.0)?;
-                buf.write_u64::<BigEndian>(id.0)?;
+                buf.write_u32::<BigEndian>(session_id.0)?;
             }
-            ServerMessage::Nack { nonce, msg } => {
+            ServerMessage::Nack { session_id, msg } => {
                 buf.write_u8(NACK_TAG)?;
-                buf.write_u32::<BigEndian>(nonce.0)?;
+                buf.write_u32::<BigEndian>(session_id.0)?;
                 buf.write_all(msg.as_bytes())?;
             }
-            ServerMessage::Error { id, msg } => {
+            ServerMessage::Error { session_id, msg } => {
                 buf.write_u8(ERROR_TAG)?;
-                buf.write_u64::<BigEndian>(id.0)?;
+                buf.write_u32::<BigEndian>(session_id.0)?;
                 buf.write_all(msg.as_bytes())?;
             }
-            ServerMessage::Repeat { id, offsets } => {
+            ServerMessage::Repeat {
+                session_id,
+                offsets,
+            } => {
                 buf.write_u8(REPEAT_TAG)?;
-                buf.write_u64::<BigEndian>(id.0)?;
+                buf.write_u32::<BigEndian>(session_id.0)?;
                 for offset in offsets.as_ref() {
                     buf.write_u64::<BigEndian>(*offset)?;
                 }
             }
-            ServerMessage::Done { id } => {
+            ServerMessage::Done { session_id } => {
                 buf.write_u8(DONE_TAG)?;
-                buf.write_u64::<BigEndian>(id.0)?;
+                buf.write_u32::<BigEndian>(session_id.0)?;
             }
         }
         Ok(())
@@ -192,35 +165,34 @@ impl<'data> ServerMessage<'data> {
                 cursor,
             ))?)),
             ACK_TAG => {
-                let nonce = cursor
+                let session_id = cursor
                     .read_u32::<BigEndian>()
-                    .wrap_err("incomplete ack message, could not read nonce")?
+                    .wrap_err("incomplete ack message, could not read session")?
                     .into();
-                let id = cursor
-                    .read_u64::<BigEndian>()
-                    .wrap_err("incomplete ack message, could not read id")?
-                    .into();
-                Ok(Self::Ack { nonce, id })
+                Ok(Self::Ack { session_id })
             }
             NACK_TAG => {
-                let nonce = cursor
+                let session = cursor
                     .read_u32::<BigEndian>()
-                    .wrap_err("incomplete nack message, could not read nonce")?
+                    .wrap_err("incomplete nack message, could not read session")?
                     .into();
                 let msg = std::str::from_utf8(remaining_slice(cursor))?;
-                Ok(Self::Nack { nonce, msg })
+                Ok(Self::Nack {
+                    session_id: session,
+                    msg,
+                })
             }
             ERROR_TAG => {
-                let id = cursor
-                    .read_u64::<BigEndian>()
+                let session_id = cursor
+                    .read_u32::<BigEndian>()
                     .wrap_err("incomplete error message, could not read id")?
                     .into();
                 let msg = std::str::from_utf8(remaining_slice(cursor))?;
-                Ok(Self::Error { id, msg })
+                Ok(Self::Error { session_id, msg })
             }
             REPEAT_TAG => {
-                let id = cursor
-                    .read_u64::<BigEndian>()
+                let session_id = cursor
+                    .read_u32::<BigEndian>()
                     .wrap_err("incomplete repeat message, could not read id")?
                     .into();
                 // total_len = 1 byte (tag) + 8 bytes (id) + offsets_len so
@@ -242,16 +214,16 @@ impl<'data> ServerMessage<'data> {
                 // some padding but might be worth avoiding the extra allocation
                 // and copying
                 Ok(Self::Repeat {
-                    id,
+                    session_id,
                     offsets: Cow::Owned(offsets),
                 })
             }
             DONE_TAG => {
-                let id = cursor
-                    .read_u64::<BigEndian>()
+                let session_id = cursor
+                    .read_u32::<BigEndian>()
                     .wrap_err("incomplete done message, could not read id")?
                     .into();
-                Ok(Self::Done { id })
+                Ok(Self::Done { session_id })
             }
             other => eyre::bail!("unexpected tag: {other:#02x}"),
         }
@@ -268,13 +240,13 @@ fn remaining_slice(cursor: io::Cursor<&[u8]>) -> &[u8] {
 pub enum ClientMessage<'data> {
     Discover,
     Start {
-        nonce: Nonce,
+        session_id: SessionId,
         size: u64,
         hash: Hash<'data>,
         path: &'data str,
     },
     Data {
-        id: Identifier,
+        session_id: SessionId,
         offset: u64,
         content: &'data [u8],
     },
@@ -287,24 +259,24 @@ impl<'data> ClientMessage<'data> {
                 buf.write_u8(DISCOVER_TAG)?;
             }
             ClientMessage::Start {
-                nonce,
+                session_id: session,
                 size,
                 hash,
                 path,
             } => {
                 buf.write_u8(START_TAG)?;
-                buf.write_u32::<BigEndian>(nonce.0)?;
+                buf.write_u32::<BigEndian>(session.0)?;
                 buf.write_u64::<BigEndian>(*size)?;
                 buf.write_all(hash.0.as_ref())?;
                 buf.write_all(path.as_bytes())?;
             }
             ClientMessage::Data {
-                id,
+                session_id,
                 offset,
                 content,
             } => {
                 buf.write_u8(DATA_TAG)?;
-                buf.write_u64::<BigEndian>(id.0)?;
+                buf.write_u32::<BigEndian>(session_id.0)?;
                 buf.write_u64::<BigEndian>(*offset)?;
                 buf.write_all(content)?;
             }
@@ -313,13 +285,13 @@ impl<'data> ClientMessage<'data> {
     }
 
     pub async fn encode_data_msg(
-        id: Identifier,
+        id: SessionId,
         offset: u64,
         content: impl tokio::io::AsyncRead,
         buf: &mut Vec<u8>,
     ) -> io::Result<usize> {
         buf.write_u8(DATA_TAG)?;
-        buf.write_u64::<BigEndian>(id.0)?;
+        buf.write_u32::<BigEndian>(id.0)?;
         buf.write_u64::<BigEndian>(offset)?;
 
         use tokio::io::AsyncReadExt;
@@ -341,14 +313,35 @@ impl<'data> ClientMessage<'data> {
         }
     }
 
+    pub fn encode_data_msg_sync(
+        id: SessionId,
+        offset: u64,
+        mut content: impl std::io::Read,
+        buf: &mut Vec<u8>,
+    ) -> io::Result<usize> {
+        buf.write_u8(DATA_TAG)?;
+        buf.write_u32::<BigEndian>(id.0)?;
+        buf.write_u64::<BigEndian>(offset)?;
+
+        // 1 + 8 + 8 from header
+        let mut total = 17;
+        loop {
+            let read = content.read(buf)?;
+            total += read;
+            if buf.len() == buf.capacity() || read == 0 {
+                break Ok(total);
+            }
+        }
+    }
+
     pub fn decode(buf: &'data [u8]) -> eyre::Result<Self> {
         let mut cursor = io::Cursor::new(buf);
         match cursor.read_u8().wrap_err("empty payload")? {
             DISCOVER_TAG => Ok(Self::Discover),
             START_TAG => {
-                let nonce = cursor
+                let session_id = cursor
                     .read_u32::<BigEndian>()
-                    .wrap_err("incomplete start message, could not read nonce")?
+                    .wrap_err("incomplete start message, could not read session")?
                     .into();
                 let size = cursor
                     .read_u64::<BigEndian>()
@@ -360,15 +353,15 @@ impl<'data> ClientMessage<'data> {
                 let path = std::str::from_utf8(path)?;
                 eyre::ensure!(!path.is_empty(), "path must not be empty");
                 Ok(Self::Start {
-                    nonce,
+                    session_id,
                     size,
                     hash,
                     path,
                 })
             }
             DATA_TAG => {
-                let id = cursor
-                    .read_u64::<BigEndian>()
+                let session_id = cursor
+                    .read_u32::<BigEndian>()
                     .wrap_err("incomplete data message, could not read id")?
                     .into();
                 let offset = cursor
@@ -376,7 +369,7 @@ impl<'data> ClientMessage<'data> {
                     .wrap_err("incomplete data message, could not read offset")?;
                 let content = remaining_slice(cursor);
                 Ok(Self::Data {
-                    id,
+                    session_id,
                     offset,
                     content,
                 })

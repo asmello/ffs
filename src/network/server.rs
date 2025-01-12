@@ -1,6 +1,6 @@
 use crate::{
     network::{MulticastInterface, HASHING_CHUNK_SIZE},
-    protocol::{ClientMessage, Hash, Identifier, ServerMessage, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT},
+    protocol::{ClientMessage, Hash, ServerMessage, SessionId, CHUNK_SIZE, DATAGRAM_SIZE_LIMIT},
 };
 use itertools::Itertools;
 use rand::Rng;
@@ -11,7 +11,6 @@ use std::{
 };
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncSeekExt, AsyncWriteExt},
     net::UdpSocket,
     time::Instant,
 };
@@ -42,7 +41,7 @@ struct FileEntry {
 struct ServerContext<'name> {
     name: &'name str,
     ucast_sock: UdpSocket,
-    sessions: HashMap<Identifier, FileEntry>,
+    sessions: HashMap<SessionId, FileEntry>,
     open_opts: OpenOptions,
 }
 
@@ -168,7 +167,7 @@ async fn request_repetitions(
         tracing::debug!(%id, ?offsets, "requesting repetitions");
         try_send(
             ServerMessage::Repeat {
-                id,
+                session_id: id,
                 offsets: Cow::Borrowed(offsets),
             },
             &ctx.ucast_sock,
@@ -215,7 +214,7 @@ async fn handle_message(
             reply_or_abort!(ServerMessage::Announce(ctx.name));
         }
         ClientMessage::Start {
-            nonce,
+            session_id,
             size,
             hash,
             path,
@@ -230,7 +229,7 @@ async fn handle_message(
                         path.display()
                     );
                     reply_or_abort!(ServerMessage::Nack {
-                        nonce,
+                        session_id,
                         msg: &format!("failed to create parent directories: {err}"),
                     });
                     return;
@@ -241,7 +240,7 @@ async fn handle_message(
                 Err(err) => {
                     tracing::error!("failed to open file: {}", path.display());
                     reply_or_abort!(ServerMessage::Nack {
-                        nonce,
+                        session_id,
                         msg: &format!("failed to open file: {err}"),
                     });
                     return;
@@ -251,13 +250,16 @@ async fn handle_message(
             if let Err(err) = file.set_len(size).await {
                 tracing::error!(?err, "could not pre-allocate file");
                 reply_or_abort!(ServerMessage::Nack {
-                    nonce,
+                    session_id,
                     msg: &format!("failed to pre-allocate file: {err}"),
                 });
                 return;
             }
             let id = rand::thread_rng().gen();
-            reply_or_abort!(ServerMessage::Ack { nonce, id });
+            reply_or_abort!(ServerMessage::Ack {
+                session_id,
+                transfer_id
+            });
             tracing::info!(%id, path = %path.display(), %hash, size, "started a new file transfer session");
             ctx.sessions.insert(
                 id,
@@ -273,7 +275,7 @@ async fn handle_message(
             );
         }
         ClientMessage::Data {
-            id,
+            transfer_id,
             offset,
             mut content,
         } => {
@@ -297,7 +299,7 @@ async fn handle_message(
                 tracing::error!(%id, offset, len, "chunk has unexpected length");
                 ctx.sessions.remove(&id);
                 reply_or_abort!(ServerMessage::Error {
-                    id,
+                    transfer_id,
                     msg: &format!("chunk {offset} has unexpected length {len}")
                 });
                 return;
@@ -329,7 +331,7 @@ async fn handle_message(
                 tracing::error!(?err, "could not seek file, aborting session");
                 ctx.sessions.remove(&id);
                 reply_or_abort!(ServerMessage::Error {
-                    id,
+                    transfer_id,
                     msg: &format!("at chunk {offset}, error seeking: {err}")
                 });
                 return;
@@ -338,7 +340,7 @@ async fn handle_message(
                 tracing::error!(?err, "could not write chunk, aborting session");
                 ctx.sessions.remove(&id);
                 reply_or_abort!(ServerMessage::Error {
-                    id,
+                    transfer_id,
                     msg: &format!("at chunk {offset}, error writing: {err}")
                 });
                 return;
@@ -364,7 +366,7 @@ async fn handle_message(
                             if hash != entry.hash {
                                 tracing::error!(computed = %hash, expected = %entry.hash, "hash mismatch!");
                                 reply_or_abort!(ServerMessage::Error {
-                                    id,
+                                    transfer_id,
                                     msg: &format!(
                                         "mismatched hash! got {hash}, expected {}",
                                         entry.hash
@@ -376,13 +378,13 @@ async fn handle_message(
                         Err(err) => {
                             tracing::error!(?err, "could not calculate hash, aborting session");
                             reply_or_abort!(ServerMessage::Error {
-                                id,
+                                transfer_id,
                                 msg: &format!("error calculating hash: {err}")
                             });
                             return;
                         }
                     };
-                    reply_or_abort!(ServerMessage::Done { id });
+                    reply_or_abort!(ServerMessage::Done { transfer_id });
                     tracing::info!(%id, len = entry.curr_size, hash = %entry.hash, "file transfer completed successfully");
                 }
                 Ordering::Greater => {
@@ -398,7 +400,7 @@ async fn handle_message(
                         .remove(&id)
                         .expect("we hold a &mut so the entry must still be there");
                     reply_or_abort!(ServerMessage::Error {
-                        id,
+                        transfer_id,
                         msg: &format!(
                             "payload overflow: received {} bytes, expected {}",
                             entry.curr_size, entry.expected_size

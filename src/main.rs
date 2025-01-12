@@ -1,10 +1,5 @@
-mod file_generator;
-mod network;
-mod protocol;
-mod tui;
-
 use clap::{Parser, Subcommand};
-use network::{
+use ffs::network::{
     client::{broadcast_from_path, send_interactive},
     server::receive,
 };
@@ -69,7 +64,7 @@ async fn main() -> eyre::Result<()> {
 
     let args = Args::parse();
 
-    let ip_version = match (args.use_ipv4, args.use_ipv6) {
+    let addr = match (args.use_ipv4, args.use_ipv6) {
         (true, true) => unreachable!("clap should enforce ip version choice is mutually exclusive"),
         (true, false) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
         (false, true) | (false, false) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
@@ -83,7 +78,7 @@ async fn main() -> eyre::Result<()> {
                 let hostname = hostname::get()?;
                 hostname.to_string_lossy().into_owned()
             };
-            receive(&name, ip_version, overwrite).await?;
+            receive(&name, addr, overwrite).await?;
         }
         Command::Send {
             path,
@@ -91,10 +86,10 @@ async fn main() -> eyre::Result<()> {
             grace_period_ms,
         } => {
             if interactive {
-                send_interactive(ip_version, &path).await;
+                send_interactive(addr, &path).await;
             } else {
                 let grace_period = Duration::from_millis(grace_period_ms);
-                broadcast_from_path(ip_version, &path, grace_period).await?;
+                broadcast_from_path(addr, &path, grace_period).await?;
             }
         }
     }
