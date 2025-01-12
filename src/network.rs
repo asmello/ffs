@@ -3,12 +3,14 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
 };
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
     net::UdpSocket,
 };
+use tokio_util::bytes::BufMut;
 
 use crate::protocol::Hash;
 
@@ -103,6 +105,29 @@ async fn hash(mut file: File, size: usize, mut buf: &mut Vec<u8>) -> io::Result<
         .to_vec()
         .try_into()
         .expect("sha256 has 32 bytes exactly"))
+}
+
+#[derive(Debug, Clone)]
+struct UdpSender(Arc<UdpSocket>);
+
+impl UdpSender {
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, target).await
+    }
+}
+
+#[derive(Debug)]
+struct UdpReceiver(Arc<UdpSocket>);
+
+impl UdpReceiver {
+    async fn recv_from(&self, buf: &mut impl BufMut) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_buf_from(buf).await
+    }
+}
+
+fn split_udp_socket(socket: UdpSocket) -> (UdpSender, UdpReceiver) {
+    let wrapped = Arc::new(socket);
+    (UdpSender(wrapped.clone()), UdpReceiver(wrapped))
 }
 
 #[cfg(test)]

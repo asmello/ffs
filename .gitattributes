@@ -1,0 +1,11 @@
+tests/resources/dir1/foo filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir1/foo/deep filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir1/foo/deep/foo.txt filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir1/foo/shakespeare.txt filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir2 filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir2/IMPORTANT.md filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir1 filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir1/bar filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir1/bar/big.bin filter=lfs diff=lfs merge=lfs -text
+tests/resources/dir2/empty.txt filter=lfs diff=lfs merge=lfs -text
+tests/resources/hello.txt filter=lfs diff=lfs merge=lfs -text
